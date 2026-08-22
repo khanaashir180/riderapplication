@@ -214,7 +214,7 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
   }
 
   // Helper to fetch and normalize Shopify orders
-  async function fetchAndNormalizeShopifyOrders(config: { storeDomain: string; accessToken: string; apiVersion: string }, options: { limit?: number; status?: string; fulfillmentStatus?: string; updatedSince?: string } = {}) {
+  async function fetchAndNormalizeShopifyOrders(config: { storeDomain: string; accessToken: string; apiVersion: string }, options: { limit?: number; status?: string; fulfillmentStatus?: string; updatedSince?: string; after?: string | null } = {}) {
     const limit = Math.min(Math.max(Number(options.limit || 50), 1), 250);
     const status = options.status || "open";
     const fulfillmentStatus = options.fulfillmentStatus !== undefined ? options.fulfillmentStatus : "unfulfilled";
@@ -222,7 +222,7 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
     const queryParts = [`status:${status}`];
     if (fulfillmentStatus) queryParts.push(`fulfillment_status:${fulfillmentStatus}`);
     if (options.updatedSince) queryParts.push(`updated_at:>=${options.updatedSince}`);
-    const json = await shopifyGraphQL(config, `query Orders($first: Int!, $query: String) { orders(first: $first, query: $query, sortKey: UPDATED_AT, reverse: true) { nodes { id legacyResourceId name orderNumber createdAt updatedAt cancelledAt financialStatus currentTotalPriceSet { shopMoney { amount currencyCode } } totalPriceSet { shopMoney { amount currencyCode } } totalOutstandingSet { shopMoney { amount currencyCode } } email phone note tags paymentGatewayNames customer { id firstName lastName email phone } shippingAddress { firstName lastName phone address1 address2 city province country zip } lineItems(first: 100) { nodes { title name quantity sku variantTitle variant { id } originalUnitPriceSet { shopMoney { amount } } } } } } }`, { first: limit, query: queryParts.join(" ") });
+    const json = await shopifyGraphQL(config, `query Orders($first: Int!, $after: String, $query: String) { orders(first: $first, after: $after, query: $query, sortKey: UPDATED_AT, reverse: true) { nodes { id legacyResourceId name orderNumber createdAt updatedAt cancelledAt financialStatus currentTotalPriceSet { shopMoney { amount currencyCode } } totalPriceSet { shopMoney { amount currencyCode } } totalOutstandingSet { shopMoney { amount currencyCode } } email phone note tags paymentGatewayNames customer { id firstName lastName email phone } shippingAddress { firstName lastName phone address1 address2 city province country zip } lineItems(first: 100) { nodes { title name quantity sku variantTitle variant { id } originalUnitPriceSet { shopMoney { amount } } } } } pageInfo { hasNextPage endCursor } } }`, { first: limit, after: options.after || null, query: queryParts.join(" ") });
     const rawOrders: any[] = (json.data?.orders?.nodes || []).map((order: any) => ({
       ...order,
       id: order.legacyResourceId || String(order.id || "").split("/").pop(),
@@ -353,6 +353,7 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
       };
     });
 
+    (normalizedOrders as any).pageInfo = json.data?.orders?.pageInfo || { hasNextPage: false, endCursor: null };
     return normalizedOrders;
   }
 
@@ -1067,7 +1068,17 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
     if (!config.configured || !config.storeDomain || !config.accessToken) return { skipped: true, reason: "SHOPIFY_NOT_CONFIGURED" };
     const checkpointRef = db.collection("integrationCheckpoints").doc("shopify");
     const checkpoint = (await checkpointRef.get()).data() || {};
-    const orders = await fetchAndNormalizeShopifyOrders(config, { limit: 250, status: "any", fulfillmentStatus: "", updatedSince: checkpoint.updatedSince });
+    const reconciliationStartedAt = new Date().toISOString();
+    await checkpointRef.set({ lastReconciliationAt: reconciliationStartedAt }, { merge: true });
+    const orders: any[] = [];
+    let after: string | null = null;
+    let pageCount = 0;
+    do {
+      const page: any = await fetchAndNormalizeShopifyOrders(config, { limit: 250, status: "any", fulfillmentStatus: "", updatedSince: checkpoint.lastShopifyUpdatedAtCheckpoint || checkpoint.updatedSince, after });
+      orders.push(...page);
+      after = page.pageInfo?.hasNextPage ? page.pageInfo.endCursor : null;
+      pageCount++;
+    } while (after && pageCount < 100);
     const timestamp = new Date().toISOString();
     let missingLocal = 0;
     let mirrorsRepaired = 0;
@@ -1108,8 +1119,8 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
         await db.collection("exceptions").doc(`shopify_reconcile_${order.shopifyId}`).set({ id: `shopify_reconcile_${order.shopifyId}`, code: paymentChanged ? "PAYMENT_CHANGED_DURING_CUSTODY" : "ADDRESS_CHANGED_DURING_CUSTODY", shopifyOrderId: String(order.shopifyId), packageId: order.packageId, status: "OPEN", resolutionStatus: "pending", severity: "HIGH", message: "Periodic Shopify reconciliation found a commerce change after custody; package state was preserved.", createdAt: timestamp }, { merge: true });
       }
     }
-    await checkpointRef.set({ updatedSince: timestamp, lastRunAt: timestamp, fetched: orders.length, missingLocal, mirrorsRepaired, custodyExceptions }, { merge: true });
-    return { skipped: false, fetched: orders.length, missingLocal, mirrorsRepaired, custodyExceptions, lastRunAt: timestamp };
+    await checkpointRef.set({ updatedSince: timestamp, lastReconciliationAt: timestamp, lastSuccessfulReconciliationAt: timestamp, lastSuccessfulShopifyUpdatedAtCheckpoint: timestamp, lastShopifyUpdatedAtCheckpoint: timestamp, lastRunAt: timestamp, fetched: orders.length, pages: pageCount, missingLocal, mirrorsRepaired, custodyExceptions }, { merge: true });
+    return { skipped: false, fetched: orders.length, pages: pageCount, missingLocal, mirrorsRepaired, custodyExceptions, lastRunAt: timestamp };
   }
 
   router.get("/webhooks/dead-letter", requireAuth, requireAnyRole("super_admin", "dispatch_manager"), async (_req: any, res: any) => {

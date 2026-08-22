@@ -15,7 +15,7 @@ import { createLogisticsRouter } from "./src/server/logisticsRouter.js";
 import { createAdminUserRouter, AdminUserTestHooks } from "./src/server/adminUserRouter.js";
 import { createShopifyRouter } from "./src/server/shopifyRouter.js";
 import { createManagementRouter } from "./src/server/managementRouter.js";
-import { enqueueShopifyOutboundEvent } from "./src/services/shopifyOutbound.js";
+import { enqueueShopifyOutboundEvent, enqueueShopifyPackageEvent } from "./src/services/shopifyOutbound.js";
 
 const PORT = 3000;
 
@@ -1422,6 +1422,12 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         riderId,
         actorUid: req.auth.uid
       });
+      void enqueueShopifyPackageEvent(db, {
+        packageId,
+        eventType: "PACKAGE_ASSIGNED",
+        payload: { riderId, assignedByUid: req.auth.uid },
+        idempotencyKey: `assign:${packageId}:${riderId}:${result?.assignedAt || "current"}`
+      }).catch((error) => console.error("Shopify assignment write-back enqueue failed", error));
       return res.json({ success: true, data: result });
     } catch (err: any) {
       const status = err.status || 400;
@@ -1539,6 +1545,15 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
       const allFailed = assignedResults.length === 0 && errors.length > 0;
       const statusCode = allFailed && errors[0]?.code === "PACKAGE_ALREADY_ASSIGNED" ? 409 : (allFailed ? 400 : 200);
 
+      for (const assignedPackageId of assignedResults) {
+        void enqueueShopifyPackageEvent(db, {
+          packageId: assignedPackageId,
+          eventType: "PACKAGE_ASSIGNED",
+          payload: { riderId, assignedByUid: req.auth.uid },
+          idempotencyKey: `bulk-assign:${assignedPackageId}:${riderId}:${nowStr}`
+        }).catch((error) => console.error("Shopify bulk assignment write-back enqueue failed", error));
+      }
+
       return res.status(statusCode).json({
         success: errors.length === 0,
         data: {
@@ -1575,6 +1590,12 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         actorRole: req.auth.role,
         actorRiderId: req.auth.riderId
       });
+      void enqueueShopifyPackageEvent(db, {
+        packageId,
+        eventType: "PACKAGE_TRANSFERRED",
+        payload: { destinationRiderId, transferReason, transferredByUid: req.auth.uid },
+        idempotencyKey: `transfer:${packageId}:${destinationRiderId}:${result?.transferredAt || "current"}`
+      }).catch((error) => console.error("Shopify transfer write-back enqueue failed", error));
       return res.json({ success: true, data: result });
     } catch (err: any) {
       const status = err.status || 400;
@@ -1692,6 +1713,14 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
       });
 
       // Note: Creating a run MUST NOT automatically mark packages Out for Delivery!
+      for (const packageId of packageIds) {
+        void enqueueShopifyPackageEvent(db, {
+          packageId,
+          eventType: "DISPATCH_RUN_CREATED",
+          payload: { runId, runNumber, riderId, dispatchDate: runData.dispatchDate },
+          idempotencyKey: `run:${runId}:${packageId}`
+        }).catch((error) => console.error("Shopify dispatch run write-back enqueue failed", error));
+      }
       return res.json({ success: true, data: runData });
     } catch (err: any) {
       const status = err.status || 500;
@@ -3484,6 +3513,14 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         });
       });
 
+      if (!alreadyHandedBack) {
+        void enqueueShopifyPackageEvent(db, {
+          packageId,
+          eventType: "RETURN_STATUS_CHANGED",
+          payload: { returnStatus: "rider_handed_back", returnReason: responseData?.returnReason || null, actorUid: req.auth.uid },
+          idempotencyKey: `return-handback:${idemKey}`
+        }).catch((error) => console.error("Shopify rider handback write-back enqueue failed", error));
+      }
       return res.json({
         success: true,
         data: responseData,
@@ -3614,6 +3651,12 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         });
       });
 
+      void enqueueShopifyPackageEvent(db, {
+        packageId,
+        eventType: "RETURN_STATUS_CHANGED",
+        payload: { returnStatus: "warehouse_received", actorUid: req.auth.uid },
+        idempotencyKey: `warehouse-receipt:${idemKey}`
+      }).catch((error) => console.error("Shopify warehouse receipt write-back enqueue failed", error));
       return res.json({ success: true, data: receiptData });
     } catch (err: any) {
       const status = err.status || 400;
