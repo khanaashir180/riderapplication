@@ -71,7 +71,9 @@ export function verifySessionToken(token: string): { uid: string; email: string;
     if (parts.length !== 3) return null;
     const [header, body, sig] = parts;
     const expectedSig = crypto.createHmac("sha256", SESSION_SECRET).update(`${header}.${body}`).digest("base64url");
-    if (crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expectedSig))) {
+    const sigBuf = Buffer.from(sig);
+    const expectedSigBuf = Buffer.from(expectedSig);
+    if (sigBuf.length === expectedSigBuf.length && crypto.timingSafeEqual(sigBuf, expectedSigBuf)) {
       const data = JSON.parse(Buffer.from(body, "base64url").toString("utf-8"));
       if (data.exp && data.exp < Math.floor(Date.now() / 1000)) {
         return null;
@@ -98,15 +100,19 @@ async function requireAuth(req: any, res: any, next: any) {
     let uid = "";
     let decodedEmail = "";
 
-    try {
-      const decodedToken = await adminAuth.verifyIdToken(token, true);
-      uid = decodedToken.uid;
-      decodedEmail = decodedToken.email || "";
-    } catch (fbErr) {
-      const sessionData = verifySessionToken(token);
-      if (sessionData && sessionData.uid) {
-        uid = sessionData.uid;
-        decodedEmail = sessionData.email || "";
+    // 1. Try local session token fast path
+    const sessionData = verifySessionToken(token);
+    if (sessionData && sessionData.uid) {
+      uid = sessionData.uid;
+      decodedEmail = sessionData.email || "";
+    } else {
+      // 2. Fall back to Firebase ID Token
+      try {
+        const decodedToken = await adminAuth.verifyIdToken(token);
+        uid = decodedToken.uid;
+        decodedEmail = decodedToken.email || "";
+      } catch (fbErr) {
+        // Token verification failed
       }
     }
 
@@ -819,6 +825,9 @@ async function createDoubleEntryTransaction(db: any, params: {
 export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
   const app = express();
 
+  // Trust proxy for reverse proxy environments (Google Cloud Run / nginx)
+  app.set("trust proxy", 1);
+
   // Baseline Security Headers
   app.use(
     helmet({
@@ -850,6 +859,7 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
     max: 300,
     standardHeaders: true,
     legacyHeaders: false,
+    validate: { xForwardedForHeader: false, default: false },
     message: {
       success: false,
       error: { code: "RATE_LIMIT_EXCEEDED", message: "Too many authentication requests. Please try again later." }
@@ -861,6 +871,7 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
     max: 200,
     standardHeaders: true,
     legacyHeaders: false,
+    validate: { xForwardedForHeader: false, default: false },
     message: {
       success: false,
       error: { code: "RATE_LIMIT_EXCEEDED", message: "Too many finance requests. Please try again later." }
@@ -872,6 +883,7 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
     max: 300,
     standardHeaders: true,
     legacyHeaders: false,
+    validate: { xForwardedForHeader: false, default: false },
     message: {
       success: false,
       error: { code: "RATE_LIMIT_EXCEEDED", message: "Too many delivery requests. Please try again later." }

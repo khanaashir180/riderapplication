@@ -106,13 +106,25 @@ export type ApiResponse<T> = {
   riders?: Rider[];
 };
 
-let activeAuthToken = "";
+const SESSION_STORAGE_KEY = 'gomila_auth_session_token';
+
+let activeAuthToken = typeof window !== 'undefined' ? (localStorage.getItem(SESSION_STORAGE_KEY) || '') : '';
 
 export function setApiAuthToken(token: string) {
-  activeAuthToken = token;
+  activeAuthToken = token || '';
+  if (typeof window !== 'undefined') {
+    if (token) {
+      localStorage.setItem(SESSION_STORAGE_KEY, token);
+    } else {
+      localStorage.removeItem(SESSION_STORAGE_KEY);
+    }
+  }
 }
 
 export function getApiAuthToken(): string {
+  if (!activeAuthToken && typeof window !== 'undefined') {
+    activeAuthToken = localStorage.getItem(SESSION_STORAGE_KEY) || '';
+  }
   return activeAuthToken;
 }
 
@@ -122,8 +134,9 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<ApiR
     ...(options.headers as Record<string, string> || {})
   };
 
-  if (activeAuthToken) {
-    headers["Authorization"] = `Bearer ${activeAuthToken}`;
+  const token = getApiAuthToken();
+  if (token) {
+    headers["Authorization"] = `Bearer ${token}`;
   }
 
   const res = await fetch(path, { ...options, headers });
@@ -131,6 +144,12 @@ async function request<T>(path: string, options: RequestInit = {}): Promise<ApiR
 
   if (!res.ok || json.success === false) {
     const code = json.error?.code || json.code || `HTTP_${res.status}`;
+    if (res.status === 401 && (code === 'TOKEN_EXPIRED_OR_INVALID' || code === 'UNAUTHENTICATED')) {
+      if (typeof window !== 'undefined') {
+        localStorage.removeItem(SESSION_STORAGE_KEY);
+        activeAuthToken = '';
+      }
+    }
     const message = json.error?.message || json.message || res.statusText || 'API Request Failed';
     throw new ApiError(message, res.status || 500, code, json.error?.details || json);
   }
