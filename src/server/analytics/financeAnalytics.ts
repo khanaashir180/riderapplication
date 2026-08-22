@@ -17,6 +17,19 @@ function sumPostings(postings: any[], accountCode: string, side: "debit" | "cred
     .reduce((sum, posting) => sum + toAmount(side === "debit" ? posting.debitAmount : posting.creditAmount), 0);
 }
 
+export type FinanceReconciliationReason =
+  | "OPEN_COLLECTION_VARIANCE"
+  | "DIGITAL_VERIFICATION_PENDING"
+  | "RIDER_CASH_OUTSTANDING"
+  | "SETTLEMENT_SHORTAGE"
+  | "SETTLEMENT_EXCESS"
+  | "LEDGER_IMBALANCE"
+  | "UNRESOLVED_DISCREPANCY";
+
+function componentStatus(condition: boolean) {
+  return condition ? "MATCHED" : "ATTENTION_REQUIRED";
+}
+
 export function buildFinanceAnalytics(dataset: LoadedAnalyticsDataset, filters: ManagementFilters) {
   const range = getRangeForFilters(filters);
   const indexes = buildIndexes(dataset);
@@ -98,6 +111,26 @@ export function buildFinanceAnalytics(dataset: LoadedAnalyticsDataset, filters: 
   const openExcess = openExcessRows.reduce((sum, row) => sum + row.amount, 0);
   const settled = cashierReceivedToday - openShortage + openExcess;
   const reconciliationDifference = cashCodToday - cashierReceivedToday - cashWithRiders - openShortage + openExcess;
+  const ledgerDebits = dataset.financialPostings.reduce((sum, posting) => sum + toAmount(posting.debitAmount), 0);
+  const ledgerCredits = dataset.financialPostings.reduce((sum, posting) => sum + toAmount(posting.creditAmount), 0);
+  const ledgerDifference = ledgerDebits - ledgerCredits;
+  const unresolvedFinancialDiscrepancyCount = dataset.exceptions.filter((exception) => {
+    const status = String(exception.status || exception.resolutionStatus || "OPEN").toUpperCase();
+    const code = String(exception.code || exception.type || exception.category || "").toUpperCase();
+    return !["RESOLVED", "CLOSED", "APPROVED"].includes(status) && /FINANC|COD|SETTLEMENT|PAYMENT|LEDGER|COLLECTION/.test(code);
+  }).length;
+  const reasons: FinanceReconciliationReason[] = [];
+  if (Math.abs(openCollectionVarianceAmount) > 0.0001) reasons.push("OPEN_COLLECTION_VARIANCE");
+  if (Math.abs(digitalVerificationPendingAmount) > 0.0001) reasons.push("DIGITAL_VERIFICATION_PENDING");
+  if (Math.abs(cashWithRiders) > 0.0001) reasons.push("RIDER_CASH_OUTSTANDING");
+  if (Math.abs(openShortage) > 0.0001) reasons.push("SETTLEMENT_SHORTAGE");
+  if (Math.abs(openExcess) > 0.0001) reasons.push("SETTLEMENT_EXCESS");
+  if (Math.abs(ledgerDifference) > 0.0001) reasons.push("LEDGER_IMBALANCE");
+  if (unresolvedFinancialDiscrepancyCount > 0) reasons.push("UNRESOLVED_DISCREPANCY");
+  const cashReconciliationMatched = Math.abs(reconciliationDifference) < 0.0001;
+  const digitalReconciliationMatched = Math.abs(digitalVerificationPendingAmount) < 0.0001;
+  const collectionReconciliationMatched = Math.abs(openCollectionVarianceAmount) < 0.0001;
+  const ledgerReconciliationMatched = Math.abs(ledgerDifference) < 0.0001;
 
   const summary: ManagementMetric[] = [
     makeMetric({
@@ -218,13 +251,27 @@ export function buildFinanceAnalytics(dataset: LoadedAnalyticsDataset, filters: 
     range,
     summary,
     reconciliation: {
-      status: Math.abs(reconciliationDifference) < 0.0001 ? "MATCHED" : "ATTENTION_REQUIRED",
+      status: cashReconciliationMatched && Math.abs(cashWithRiders) < 0.0001 && Math.abs(openShortage) < 0.0001 && Math.abs(openExcess) < 0.0001 && collectionReconciliationMatched && digitalReconciliationMatched && ledgerReconciliationMatched && unresolvedFinancialDiscrepancyCount === 0 ? "MATCHED" : "ATTENTION_REQUIRED",
+      reasonFlags: reasons,
+      unresolvedFinancialDiscrepancyCount,
       equation: `Cash COD Collected (${formatCurrency(cashCodToday)}) - Cashier Received (${formatCurrency(cashierReceivedToday)}) - Cash Still With Riders (${formatCurrency(cashWithRiders)}) - Open Shortage (${formatCurrency(openShortage)}) + Open Excess (${formatCurrency(openExcess)}) = ${formatCurrency(reconciliationDifference)}`,
       difference: reconciliationDifference,
+      cashReconciliationDifference: reconciliationDifference,
+      openCollectionVariance: openCollectionVarianceAmount,
+      digitalVerificationPending: digitalVerificationPendingAmount,
+      cashWithRiders,
+      openShortage,
+      openExcess,
+      components: {
+        cash: { status: componentStatus(cashReconciliationMatched && Math.abs(cashWithRiders) < 0.0001 && Math.abs(openShortage) < 0.0001 && Math.abs(openExcess) < 0.0001), difference: reconciliationDifference },
+        digital: { status: componentStatus(digitalReconciliationMatched), pending: digitalVerificationPendingAmount },
+        collection: { status: componentStatus(collectionReconciliationMatched), variance: openCollectionVarianceAmount },
+        ledger: { status: componentStatus(ledgerReconciliationMatched), difference: ledgerDifference }
+      },
       ledger: {
-        debits: dataset.financialPostings.reduce((sum, posting) => sum + toAmount(posting.debitAmount), 0),
-        credits: dataset.financialPostings.reduce((sum, posting) => sum + toAmount(posting.creditAmount), 0),
-        difference: dataset.financialPostings.reduce((sum, posting) => sum + toAmount(posting.debitAmount) - toAmount(posting.creditAmount), 0)
+        debits: ledgerDebits,
+        credits: ledgerCredits,
+        difference: ledgerDifference
       }
     },
     drilldowns: {

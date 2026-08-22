@@ -259,7 +259,27 @@ export function ManagementDashboard({ onSelectOrder }: ManagementDashboardProps)
             <div className={`mt-2 inline-flex rounded-full px-3 py-1 text-xs font-bold ${finance.reconciliation?.status === 'MATCHED' ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
               {finance.reconciliation?.status === 'MATCHED' ? 'MATCHED' : 'ATTENTION REQUIRED'}
             </div>
+            {finance.reconciliation?.reasonFlags?.length > 0 && (
+              <div className="mt-3 flex flex-wrap gap-2">
+                {finance.reconciliation.reasonFlags.map((reason: string) => (
+                  <span key={reason} className="rounded-full bg-red-50 px-2 py-1 text-[10px] font-bold tracking-wide text-red-800">{reason}</span>
+                ))}
+              </div>
+            )}
             <p className="text-sm text-[#1F1F1D] mt-3 leading-6">{finance.reconciliation?.equation}</p>
+            <div className="grid grid-cols-2 gap-2 mt-3 md:grid-cols-4">
+              {[
+                ['CASH RECONCILIATION', finance.reconciliation?.components?.cash],
+                ['DIGITAL RECONCILIATION', finance.reconciliation?.components?.digital],
+                ['ORDER COLLECTION RECONCILIATION', finance.reconciliation?.components?.collection],
+                ['LEDGER RECONCILIATION', finance.reconciliation?.components?.ledger]
+              ].map(([label, component]: any) => (
+                <div key={label} className="rounded-lg border border-[#DDD9D4] bg-white p-2">
+                  <p className="text-[9px] font-bold tracking-wide text-[#6D6964]">{label}</p>
+                  <p className={`mt-1 text-xs font-black ${component?.status === 'MATCHED' ? 'text-emerald-700' : label === 'DIGITAL RECONCILIATION' ? 'text-amber-700' : 'text-red-700'}`}>{component?.status === 'MATCHED' ? 'MATCHED' : label === 'DIGITAL RECONCILIATION' ? 'PENDING' : 'ATTENTION'}</p>
+                </div>
+              ))}
+            </div>
             <div className="grid grid-cols-3 gap-3 mt-3 text-sm">
               <KeyMetricSmall label="Ledger Debits" value={formatCurrency(finance.reconciliation?.ledger?.debits)} />
               <KeyMetricSmall label="Ledger Credits" value={formatCurrency(finance.reconciliation?.ledger?.credits)} />

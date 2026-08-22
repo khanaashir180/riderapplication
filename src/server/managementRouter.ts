@@ -10,12 +10,15 @@ import { buildIndexes, formatCurrency, getRangeForFilters, loadAnalyticsDataset,
 
 export function createManagementRouter(db: FirebaseFirestore.Firestore, requireAuth: any, requireRole: any) {
   const router = Router();
-  const managementReadOnly = requireRole("super_admin", "dispatch_manager", "management_viewer", "cashier", "customer_service", "warehouse_staff");
+  const fullDashboard = requireRole("super_admin", "management_viewer");
+  const operationsReadOnly = requireRole("super_admin", "dispatch_manager", "management_viewer");
+  const financeReadOnly = requireRole("super_admin", "cashier", "management_viewer");
+  const returnsReadOnly = requireRole("super_admin", "dispatch_manager", "customer_service", "warehouse_staff", "management_viewer");
 
-  router.get("/overview", requireAuth, managementReadOnly, async (req: any, res: any) => {
+  router.get("/overview", requireAuth, fullDashboard, async (req: any, res: any) => {
     try {
       const filters = parseManagementFilters(req.query);
-      const dataset = await loadAnalyticsDataset(db);
+      const dataset = await loadAnalyticsDataset(db, filters);
       const operations = buildOperationsAnalytics(dataset, filters);
       const finance = buildFinanceAnalytics(dataset, filters);
       const returns = buildReturnsAnalytics(dataset, filters);
@@ -67,10 +70,10 @@ export function createManagementRouter(db: FirebaseFirestore.Firestore, requireA
     }
   });
 
-  router.get("/riders", requireAuth, managementReadOnly, async (req: any, res: any) => {
+  router.get("/riders", requireAuth, operationsReadOnly, async (req: any, res: any) => {
     try {
       const filters = parseManagementFilters(req.query);
-      const dataset = await loadAnalyticsDataset(db);
+      const dataset = await loadAnalyticsDataset(db, filters);
       const riders = buildRiderAnalytics(dataset, filters);
       return res.json({ success: true, data: riders });
     } catch (err: any) {
@@ -78,10 +81,10 @@ export function createManagementRouter(db: FirebaseFirestore.Firestore, requireA
     }
   });
 
-  router.get("/finance", requireAuth, managementReadOnly, async (req: any, res: any) => {
+  router.get("/finance", requireAuth, financeReadOnly, async (req: any, res: any) => {
     try {
       const filters = parseManagementFilters(req.query);
-      const dataset = await loadAnalyticsDataset(db);
+      const dataset = await loadAnalyticsDataset(db, filters);
       const finance = buildFinanceAnalytics(dataset, filters);
       return res.json({ success: true, data: finance });
     } catch (err: any) {
@@ -89,10 +92,10 @@ export function createManagementRouter(db: FirebaseFirestore.Firestore, requireA
     }
   });
 
-  router.get("/returns", requireAuth, managementReadOnly, async (req: any, res: any) => {
+  router.get("/returns", requireAuth, returnsReadOnly, async (req: any, res: any) => {
     try {
       const filters = parseManagementFilters(req.query);
-      const dataset = await loadAnalyticsDataset(db);
+      const dataset = await loadAnalyticsDataset(db, filters);
       const returns = buildReturnsAnalytics(dataset, filters);
       return res.json({ success: true, data: returns });
     } catch (err: any) {
@@ -100,10 +103,10 @@ export function createManagementRouter(db: FirebaseFirestore.Firestore, requireA
     }
   });
 
-  router.get("/exceptions", requireAuth, managementReadOnly, async (req: any, res: any) => {
+  router.get("/exceptions", requireAuth, returnsReadOnly, async (req: any, res: any) => {
     try {
       const filters = parseManagementFilters(req.query);
-      const dataset = await loadAnalyticsDataset(db);
+      const dataset = await loadAnalyticsDataset(db, filters);
       const exceptions = buildExceptionsAnalytics(dataset, filters);
       return res.json({ success: true, data: exceptions });
     } catch (err: any) {
@@ -111,10 +114,10 @@ export function createManagementRouter(db: FirebaseFirestore.Firestore, requireA
     }
   });
 
-  router.get("/activity", requireAuth, managementReadOnly, async (req: any, res: any) => {
+  router.get("/activity", requireAuth, fullDashboard, async (req: any, res: any) => {
     try {
       const filters = parseManagementFilters(req.query);
-      const dataset = await loadAnalyticsDataset(db);
+      const dataset = await loadAnalyticsDataset(db, filters);
       const activity = buildActivityAnalytics(dataset, filters);
       return res.json({ success: true, data: activity });
     } catch (err: any) {
@@ -122,11 +125,11 @@ export function createManagementRouter(db: FirebaseFirestore.Firestore, requireA
     }
   });
 
-  router.get("/drilldown", requireAuth, managementReadOnly, async (req: any, res: any) => {
+  router.get("/drilldown", requireAuth, fullDashboard, async (req: any, res: any) => {
     try {
       const filters = parseManagementFilters(req.query);
       const key = String(req.query.key || "").trim();
-      const dataset = await loadAnalyticsDataset(db);
+      const dataset = await loadAnalyticsDataset(db, filters);
       const data = buildDrilldown(dataset, filters, key);
       return res.json({ success: true, data });
     } catch (err: any) {
@@ -134,10 +137,10 @@ export function createManagementRouter(db: FirebaseFirestore.Firestore, requireA
     }
   });
 
-  router.get("/eod", requireAuth, managementReadOnly, async (req: any, res: any) => {
+  router.get("/eod", requireAuth, fullDashboard, async (req: any, res: any) => {
     try {
       const filters = parseManagementFilters({ ...req.query, datePreset: req.query.datePreset || "today" });
-      const dataset = await loadAnalyticsDataset(db);
+      const dataset = await loadAnalyticsDataset(db, filters);
       const operations = buildOperationsAnalytics(dataset, filters);
       const finance = buildFinanceAnalytics(dataset, filters);
       const returns = buildReturnsAnalytics(dataset, filters);
@@ -171,11 +174,11 @@ export function createManagementRouter(db: FirebaseFirestore.Firestore, requireA
     }
   });
 
-  router.get("/export", requireAuth, managementReadOnly, async (req: any, res: any) => {
+  router.get("/export", requireAuth, fullDashboard, async (req: any, res: any) => {
     try {
       const filters = parseManagementFilters(req.query);
       const key = String(req.query.key || "").trim();
-      const dataset = await loadAnalyticsDataset(db);
+      const dataset = await loadAnalyticsDataset(db, filters);
       const drilldown = buildDrilldown(dataset, filters, key);
       const headers = drilldown.columns.map((column) => column.label);
       const rows = drilldown.rows.map((row) => drilldown.columns.map((column) => csvEscape(row[column.key])));

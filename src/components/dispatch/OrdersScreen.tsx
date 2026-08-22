@@ -21,6 +21,7 @@ import { CSVImportDrawer } from './CSVImportDrawer';
 import { ShopifySyncModal } from './ShopifySyncModal';
 
 interface OrdersScreenProps {
+  userRole?: string;
   initialFilterStatus?: string;
   onSelectOrder: (id: string) => void;
   selectedOrderId: string | null;
@@ -28,6 +29,7 @@ interface OrdersScreenProps {
 }
 
 export function OrdersScreen({
+  userRole,
   initialFilterStatus,
   onSelectOrder,
   selectedOrderId,
@@ -236,14 +238,16 @@ export function OrdersScreen({
             <span>Export CSV</span>
           </button>
 
-          {/* Shopify Direct Sync Trigger Button */}
-          <button
-            onClick={() => setShowShopifySyncModal(true)}
-            className="px-3 py-1.5 text-xs font-bold text-[#1F1F1D] bg-[#95BF47]/20 hover:bg-[#95BF47]/30 border border-[#95BF47]/60 rounded-lg shadow-2xs flex items-center space-x-1.5 transition cursor-pointer"
-          >
-            <ShoppingBag className="w-3.5 h-3.5 text-[#43682B]" />
-            <span>Shopify Direct Sync</span>
-          </button>
+          {userRole === 'super_admin' && (
+            <button
+              onClick={() => setShowShopifySyncModal(true)}
+              title="Recovery only. Normal Shopify order flow is webhook-driven."
+              className="px-3 py-1.5 text-xs font-bold text-[#1F1F1D] bg-[#95BF47]/20 hover:bg-[#95BF47]/30 border border-[#95BF47]/60 rounded-lg shadow-2xs flex items-center space-x-1.5 transition cursor-pointer"
+            >
+              <ShoppingBag className="w-3.5 h-3.5 text-[#43682B]" />
+              <span>Shopify Recovery Sync</span>
+            </button>
+          )}
 
           {/* CSV Import Trigger Button */}
           <button

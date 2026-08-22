@@ -197,6 +197,23 @@ test('COD dashboard reconciles exact known financial batch values', () => {
   assert.equal(finance.drilldowns.cashWithRiders.reduce((sum: number, row: any) => sum + row.amount, 0), metricValue(finance.summary, 'cashWithRiders'));
 });
 
+test('overall finance status stays attention required when cash matches but collection and digital exceptions remain', () => {
+  const dataset = emptyDataset();
+  dataset.packages.push({ id: 'pkg_1', packageNumber: 'G#1', city: 'Karachi', createdAt: '2026-08-22T08:00:00+05:00', updatedAt: '2026-08-22T08:00:00+05:00', operationalStatus: 'delivered' });
+  dataset.codCollections.push({ id: 'cod_1', packageId: 'pkg_1', riderId: 'r1', expectedCod: 100000, collectedAmount: 95000, paymentMethod: 'cash', createdAt: '2026-08-22T10:00:00+05:00' });
+  dataset.codCollectionDiscrepancies.push({ id: 'variance_1', packageId: 'pkg_1', riderId: 'r1', variance: -5000, status: 'OPEN', createdAt: '2026-08-22T10:00:00+05:00' });
+  dataset.riderSettlements.push({ id: 'settlement_1', riderId: 'r1', declaredCashAmount: 95000, physicallyReceivedAmount: 95000, totalSettlementVariance: 0, status: 'cashier_received', submittedAt: '2026-08-22T16:00:00+05:00', receivedAt: '2026-08-22T17:00:00+05:00' });
+  dataset.digitalPaymentVerifications.push({ id: 'digital_1', packageId: 'pkg_2', amount: 200000, paymentMethod: 'jazzcash', status: 'pending', createdAt: '2026-08-22T12:00:00+05:00' });
+
+  const finance = buildFinanceAnalytics(dataset, filters('2026-08-22'));
+  assert.equal(finance.reconciliation.status, 'ATTENTION_REQUIRED');
+  assert.deepEqual(finance.reconciliation.reasonFlags, ['OPEN_COLLECTION_VARIANCE', 'DIGITAL_VERIFICATION_PENDING']);
+  assert.equal(finance.reconciliation.components.cash.status, 'MATCHED');
+  assert.equal(finance.reconciliation.components.ledger.status, 'MATCHED');
+  assert.equal(finance.reconciliation.components.collection.status, 'ATTENTION_REQUIRED');
+  assert.equal(finance.reconciliation.components.digital.status, 'ATTENTION_REQUIRED');
+});
+
 test('returns dashboard reflects exact required / received / pending counts', () => {
   const dataset = emptyDataset();
   for (let i = 1; i <= 20; i++) {

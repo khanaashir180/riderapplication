@@ -192,7 +192,13 @@ export function loadCollectionDocs(snapshot: any) {
   return snapshot.docs.map((doc: any) => doc.data());
 }
 
-export async function loadAnalyticsDataset(db: FirebaseFirestore.Firestore): Promise<LoadedAnalyticsDataset> {
+export async function loadAnalyticsDataset(db: FirebaseFirestore.Firestore, filters?: ManagementFilters): Promise<LoadedAnalyticsDataset> {
+  const range = filters ? getRangeForFilters(filters) : null;
+  const scopedGet = (collectionName: string, dateScoped: boolean) => {
+    const collection = db.collection(collectionName);
+    if (!range || !dateScoped) return collection.get();
+    return collection.where("createdAt", ">=", range.startIso).where("createdAt", "<=", range.endIso).get();
+  };
   const [
     packages,
     riders,
@@ -219,30 +225,30 @@ export async function loadAnalyticsDataset(db: FirebaseFirestore.Firestore): Pro
     reattemptRequests,
     importBatches
   ] = await Promise.all([
-    db.collection("packages").get(),
-    db.collection("riders").get(),
-    db.collection("profiles").get(),
-    db.collection("assignments").get(),
-    db.collection("dispatchRuns").get(),
-    db.collection("custodyScans").get(),
-    db.collection("deliveryAttempts").get(),
-    db.collection("deliveryContactEvents").get(),
-    db.collection("returns").get(),
-    db.collection("returnReceipts").get(),
-    db.collection("returnCustodyEvents").get(),
-    db.collection("codCollections").get(),
-    db.collection("codCollectionDiscrepancies").get(),
-    db.collection("financialPostings").get(),
-    db.collection("riderSettlements").get(),
-    db.collection("digitalPaymentVerifications").get(),
-    db.collection("auditLogs").get(),
-    db.collection("auditEvents").get(),
-    db.collection("financialAuditEvents").get(),
-    db.collection("exceptions").get(),
-    db.collection("customerServiceCases").get(),
-    db.collection("customerContactAttempts").get(),
-    db.collection("reattemptRequests").get(),
-    db.collection("importBatches").get()
+    scopedGet("packages", true),
+    scopedGet("riders", false),
+    scopedGet("profiles", false),
+    scopedGet("assignments", true),
+    scopedGet("dispatchRuns", true),
+    scopedGet("custodyScans", true),
+    scopedGet("deliveryAttempts", true),
+    scopedGet("deliveryContactEvents", true),
+    scopedGet("returns", true),
+    scopedGet("returnReceipts", true),
+    scopedGet("returnCustodyEvents", true),
+    scopedGet("codCollections", true),
+    scopedGet("codCollectionDiscrepancies", true),
+    scopedGet("financialPostings", true),
+    scopedGet("riderSettlements", true),
+    scopedGet("digitalPaymentVerifications", true),
+    scopedGet("auditLogs", true),
+    scopedGet("auditEvents", true),
+    scopedGet("financialAuditEvents", true),
+    scopedGet("exceptions", true),
+    scopedGet("customerServiceCases", true),
+    scopedGet("customerContactAttempts", true),
+    scopedGet("reattemptRequests", true),
+    scopedGet("importBatches", true)
   ]);
 
   return {

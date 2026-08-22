@@ -191,6 +191,7 @@ function AppContent() {
 
               {activeSubTab === 'orders' && (
                 <OrdersScreen
+                  userRole={profile?.role}
                   initialFilterStatus={ordersFilterStatus}
                   onSelectOrder={(id) => setSelectedOrderId(id)}
                   selectedOrderId={selectedOrderId}

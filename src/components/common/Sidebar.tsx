@@ -44,10 +44,10 @@ export function Sidebar({
     if (currentRole === 'super_admin') return true;
     if (currentRole === 'rider') return ws === 'rider';
     if (currentRole === 'dispatch_manager') return true;
-    if (currentRole === 'cashier') return ws === 'finance' || ws === 'dispatch' || ws === 'management';
-    if (currentRole === 'customer_service') return ws === 'returns' || ws === 'dispatch';
-    if (currentRole === 'warehouse_staff') return ws === 'returns' || ws === 'dispatch';
-    if (currentRole === 'management_viewer') return ws === 'management' || ws === 'dispatch' || ws === 'finance';
+    if (currentRole === 'cashier') return ws === 'finance';
+    if (currentRole === 'customer_service') return ws === 'returns';
+    if (currentRole === 'warehouse_staff') return ws === 'returns';
+    if (currentRole === 'management_viewer') return ws === 'management';
     return true;
   };
 
