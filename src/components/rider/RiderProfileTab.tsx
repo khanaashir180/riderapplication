@@ -6,9 +6,10 @@ interface RiderProfileTabProps {
   userProfile: Profile;
   riderInfo: Rider | null;
   onLogout?: () => void;
+  unsyncedCount?: number;
 }
 
-export function RiderProfileTab({ userProfile, riderInfo, onLogout }: RiderProfileTabProps) {
+export function RiderProfileTab({ userProfile, riderInfo, onLogout, unsyncedCount = 0 }: RiderProfileTabProps) {
   return (
     <div className="space-y-4">
       {/* Profile Header */}
@@ -64,6 +65,12 @@ export function RiderProfileTab({ userProfile, riderInfo, onLogout }: RiderProfi
           </div>
         </div>
       </div>
+
+      {unsyncedCount > 0 && (
+        <div className="bg-amber-100 border border-amber-300 rounded-2xl p-4 text-xs text-amber-950 font-bold">
+          {unsyncedCount} update{unsyncedCount === 1 ? '' : 's'} still WAITING TO SYNC. Normal logout is blocked until the server confirms them.
+        </div>
+      )}
 
       {/* Logout Action */}
       {onLogout && (

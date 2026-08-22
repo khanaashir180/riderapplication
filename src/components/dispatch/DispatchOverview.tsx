@@ -19,6 +19,7 @@ import { db } from '../../lib/firebase';
 import { Order, Rider, normalizePackage } from '../../types';
 import { api } from '../../services/api';
 import { ShopifySyncModal } from './ShopifySyncModal';
+import { buildSuggestedRuns, computeRiderCapacitySnapshot } from '../../services/dispatchPlanning';
 
 interface DispatchOverviewProps {
   onNavigateToOrders: (filterStatus?: string) => void;
@@ -133,6 +134,11 @@ export function DispatchOverview({ onNavigateToOrders, onSelectOrder }: Dispatch
 
   // Returned packages not received at warehouse
   const pendingWarehouseReturns = orders.filter(o => o.current_status === 'Returning to Warehouse');
+  const suggestedRuns = buildSuggestedRuns({
+    packages: unassigned.slice(0, 24),
+    riders,
+    activeOrders: orders
+  });
 
   const handleQuickAssign = async (orderId: string) => {
     if (!selectedRiderForAssign) {
@@ -339,8 +345,13 @@ export function DispatchOverview({ onNavigateToOrders, onSelectOrder }: Dispatch
 
           <div className="space-y-3 max-h-80 overflow-y-auto">
             {riders.map((r) => {
-              const assignedCount = r.assigned_count || orders.filter(o => o.assigned_rider_id === r.id && !['Delivered', 'Cancelled'].includes(o.current_status)).length;
-              const cap = r.maximum_daily_capacity || 25;
+              const riderOrders = orders.filter(o => o.assigned_rider_id === r.id && !['Delivered', 'Cancelled'].includes(o.current_status));
+              const capacity = computeRiderCapacitySnapshot({
+                rider: r,
+                activeOrders: riderOrders
+              });
+              const assignedCount = r.assigned_count || capacity.assignedCount;
+              const cap = capacity.maximumPackages;
               const isSelected = selectedRiderForAssign === r.id;
               const loadPercent = Math.min(100, Math.round((assignedCount / cap) * 100));
 
@@ -365,7 +376,7 @@ export function DispatchOverview({ onNavigateToOrders, onSelectOrder }: Dispatch
                   {/* Load bar */}
                   <div className="space-y-1">
                     <div className="flex justify-between text-[10px] font-medium text-[#6D6964]">
-                      <span>Load: {assignedCount} / {cap} pkgs</span>
+                      <span>Assigned / Maximum: {assignedCount} / {cap}</span>
                       <span>{loadPercent}%</span>
                     </div>
                     <div className="w-full h-1.5 bg-[#DDD9D4] rounded-full overflow-hidden">
@@ -373,6 +384,10 @@ export function DispatchOverview({ onNavigateToOrders, onSelectOrder }: Dispatch
                         className={`h-full transition-all ${loadPercent >= 90 ? 'bg-[#B43B3B]' : loadPercent >= 70 ? 'bg-[#A56716]' : 'bg-[#1F7A52]'}`} 
                         style={{ width: `${loadPercent}%` }}
                       />
+                    </div>
+                    <div className="flex justify-between text-[10px] font-medium text-[#6D6964]">
+                      <span>COD exposure / Maximum</span>
+                      <span>Rs. {capacity.codExposure.toLocaleString()} / Rs. {capacity.maximumCodExposure.toLocaleString()}</span>
                     </div>
                   </div>
                 </div>
@@ -385,6 +400,35 @@ export function DispatchOverview({ onNavigateToOrders, onSelectOrder }: Dispatch
 
       {/* Operational Exception Grid */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+        <div className="bg-white rounded-lg border border-[#DDD9D4] p-4 space-y-3">
+          <div className="flex justify-between items-center border-b border-[#DDD9D4] pb-2">
+            <div className="flex items-center space-x-2">
+              <Radio className="w-4 h-4 text-[#356A8A]" />
+              <h3 className="text-xs font-bold text-[#1F1F1D]">Suggested Runs</h3>
+            </div>
+            <span className="text-[10px] font-bold px-2 py-0.5 bg-[#356A8A]/10 text-[#356A8A] rounded">
+              {suggestedRuns.length} groups
+            </span>
+          </div>
+
+          {suggestedRuns.length === 0 ? (
+            <div className="p-4 text-center text-xs text-[#6D6964]">No suggested runs available yet</div>
+          ) : (
+            <div className="space-y-2 text-xs">
+              {suggestedRuns.slice(0, 3).map((run) => (
+                <div key={`${run.city}-${run.zone}-${run.subZone}`} className="rounded-lg border border-[#DDD9D4] bg-[#F5F4F2] p-3 space-y-1.5">
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-[#1F1F1D]">{run.zone} / {run.subZone}</span>
+                    <span className="text-[10px] font-bold text-[#356A8A]">Recommended Rider: {run.recommendedRiderId || 'Review required'}</span>
+                  </div>
+                  <p className="text-[#6D6964]">{run.packageCount} packages • Rs {run.codExposure.toLocaleString()} COD</p>
+                  <p className="text-[#6D6964]">{run.explainers[0]}</p>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+
         {/* Overdue Promised Deliveries */}
         <div className="bg-white rounded-lg border border-[#DDD9D4] p-4 space-y-3">
           <div className="flex justify-between items-center border-b border-[#DDD9D4] pb-2">

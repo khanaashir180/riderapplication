@@ -7,6 +7,8 @@ interface RiderHeaderProps {
   riderInfo: Rider | null;
   activeRun: any | null;
   activeCount: number;
+  syncStatusLabel?: string;
+  syncAlertTone?: 'online' | 'offline' | 'warning';
   onAcceptShift?: () => void;
   isAcceptingShift?: boolean;
 }
@@ -16,6 +18,8 @@ export function RiderHeader({
   riderInfo,
   activeRun,
   activeCount,
+  syncStatusLabel,
+  syncAlertTone = 'online',
   onAcceptShift,
   isAcceptingShift
 }: RiderHeaderProps) {
@@ -61,6 +65,20 @@ export function RiderHeader({
           </span>
         </div>
       </div>
+
+      {syncStatusLabel && (
+        <div
+          className={`mt-3 rounded-xl border px-3 py-2 text-[11px] font-black tracking-wide ${
+            syncAlertTone === 'offline'
+              ? 'border-amber-300 bg-amber-100 text-amber-950'
+              : syncAlertTone === 'warning'
+              ? 'border-rose-300 bg-rose-100 text-rose-900'
+              : 'border-emerald-300 bg-emerald-100 text-emerald-900'
+          }`}
+        >
+          {syncStatusLabel}
+        </div>
+      )}
 
       {/* Start Shift / Accept Manifest Banner if run awaiting acceptance */}
       {hasPendingRun && onAcceptShift && (

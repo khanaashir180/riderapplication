@@ -1,18 +1,27 @@
-import React, { useState, useEffect } from 'react';
-import { 
-  Navigation, 
-  DollarSign, 
-  Clock, 
-  RotateCcw, 
-  User, 
-  Search, 
-  CheckCircle2, 
+import React, { useEffect, useState } from 'react';
+import {
+  Navigation,
+  DollarSign,
+  Clock,
+  RotateCcw,
+  User,
+  Search,
   AlertTriangle,
   RefreshCw
 } from 'lucide-react';
-import { Profile, Rider, Order, Package } from '../../types';
+import { Profile, Rider } from '../../types';
 import { api } from '../../services/api';
-import { cacheRiderOrders, getCachedRiderOrders, getUnsyncedQueueItems } from '../../services/offline_store';
+import {
+  OfflineActor,
+  buildOfflineBannerText,
+  cacheActiveRoute,
+  flushOfflineQueueOnReconnect,
+  getLatestCachedRouteForUid,
+  getUnsyncedQueueItems,
+  initializeOfflineSync,
+  queueContactEvent,
+  subscribeToSyncStatus
+} from '../../services/offline_store';
 import { RiderHeader } from './RiderHeader';
 import { RiderHomeSummary } from './RiderHomeSummary';
 import { RiderNextStopCard } from './RiderNextStopCard';
@@ -38,69 +47,115 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [search, setSearch] = useState('');
   const [isAcceptingShift, setIsAcceptingShift] = useState(false);
-
-  // Selected Order for Delivery Attempt Modal
   const [selectedOrderForAttempt, setSelectedOrderForAttempt] = useState<any | null>(null);
-
-  // Set of contacted order IDs during this session
   const [contactedOrderIds, setContactedOrderIds] = useState<Set<string>>(new Set());
   const [contactOutcomeDraft, setContactOutcomeDraft] = useState<{ orderId: string; channel: 'CALL' | 'WHATSAPP' } | null>(null);
   const [isOffline, setIsOffline] = useState<boolean>(typeof navigator !== 'undefined' ? !navigator.onLine : false);
   const [unsyncedCount, setUnsyncedCount] = useState(0);
+  const [syncConflictCount, setSyncConflictCount] = useState(0);
+  const [syncFailedCount, setSyncFailedCount] = useState(0);
+  const [offlineNotice, setOfflineNotice] = useState<string | null>(null);
+
+  const offlineActor: OfflineActor | null = riderInfo?.id
+    ? {
+        uid: userProfile.id,
+        riderId: riderInfo.id,
+        profileId: userProfile.id,
+        fullName: userProfile.full_name
+      }
+    : null;
 
   useEffect(() => {
-    loadAllRiderData();
+    void loadAllRiderData();
   }, []);
 
   useEffect(() => {
-    const onOnline = () => setIsOffline(false);
+    const onOnline = () => {
+      setIsOffline(false);
+      void flushOfflineQueueOnReconnect(offlineActor || undefined);
+    };
     const onOffline = () => setIsOffline(true);
     window.addEventListener('online', onOnline);
     window.addEventListener('offline', onOffline);
+    const unsubscribe = subscribeToSyncStatus((payload) => {
+      setIsOffline(!payload.isOnline);
+      setUnsyncedCount(payload.pendingCount + payload.conflictCount + payload.failedCount);
+      setSyncConflictCount(payload.conflictCount);
+      setSyncFailedCount(payload.failedCount);
+    });
+    if (offlineActor) {
+      initializeOfflineSync(offlineActor);
+      void flushOfflineQueueOnReconnect(offlineActor);
+    }
     void refreshOfflineState();
     return () => {
       window.removeEventListener('online', onOnline);
       window.removeEventListener('offline', onOffline);
+      unsubscribe();
     };
-  }, []);
+  }, [offlineActor?.uid, offlineActor?.riderId]);
 
   const refreshOfflineState = async () => {
-    const pending = await getUnsyncedQueueItems().catch(() => []);
-    setUnsyncedCount(Array.isArray(pending) ? pending.length : 0);
+    const pending = await getUnsyncedQueueItems(offlineActor || undefined).catch(() => []);
+    const items = Array.isArray(pending) ? pending : [];
+    setUnsyncedCount(items.length);
+    setSyncConflictCount(items.filter((item) => item.syncStatus === 'CONFLICT').length);
+    setSyncFailedCount(items.filter((item) => item.syncStatus === 'FAILED').length);
   };
 
   const loadAllRiderData = async () => {
     setLoading(true);
     try {
-      // 1. Load Rider Profile
       const riderRes: any = await api.getRiderMe();
       if (riderRes?.data) {
         setRiderInfo(riderRes.data);
       }
 
-      // 2. Load Orders Assigned to Rider
       const ordRes: any = await api.getMyRiderOrders();
-      const rawOrders = Array.isArray(ordRes) 
-        ? ordRes 
-        : (ordRes?.orders || ordRes?.data?.orders || ordRes?.data || []);
+      const rawOrders = Array.isArray(ordRes) ? ordRes : (ordRes?.orders || ordRes?.data?.orders || ordRes?.data || []);
       const normalizedOrders = Array.isArray(rawOrders) ? rawOrders : [];
       setOrders(normalizedOrders);
-      await cacheRiderOrders(normalizedOrders);
 
-      // 3. Load Active Dispatch Run
+      let runData: any | null = null;
       try {
         const runRes = await api.getMyDispatchRun();
         if (runRes?.data) {
           setActiveRun(runRes.data);
+          runData = runRes.data;
         }
       } catch (err) {
         console.warn('No active dispatch run linked:', err);
       }
+
+      if (riderRes?.data) {
+        await cacheActiveRoute({
+          actor: {
+            uid: userProfile.id,
+            riderId: riderRes.data.id,
+            profileId: userProfile.id,
+            fullName: userProfile.full_name
+          },
+          orders: normalizedOrders,
+          activeRun: runData,
+          riderInfo: riderRes.data
+        });
+      }
+
+      setOfflineNotice(null);
     } catch (e) {
       console.error('Failed to load rider route data:', e);
-      const cachedOrders = await getCachedRiderOrders().catch(() => []);
-      if (Array.isArray(cachedOrders) && cachedOrders.length > 0) {
-        setOrders(cachedOrders);
+      const cachedRoute = await getLatestCachedRouteForUid(userProfile.id).catch(() => null);
+      if (cachedRoute) {
+        setOrders(cachedRoute.routePackages);
+        setActiveRun(cachedRoute.activeRun);
+        setRiderInfo((prev) => prev || ({
+          id: cachedRoute.riderId,
+          rider_code: cachedRoute.riderInfo?.riderCode,
+          assigned_zone: cachedRoute.riderInfo?.assignedZone,
+          vehicle_type: cachedRoute.riderInfo?.vehicleType,
+          maximum_daily_capacity: cachedRoute.riderInfo?.maximumDailyCapacity
+        } as Rider));
+        setOfflineNotice('Showing cached route. WAITING TO SYNC remains until the server confirms each update.');
       }
     } finally {
       await refreshOfflineState();
@@ -114,7 +169,6 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
     await loadAllRiderData();
   };
 
-  // Accept Shift Manifest
   const handleAcceptShift = async () => {
     if (!activeRun?.id) return;
     setIsAcceptingShift(true);
@@ -142,7 +196,20 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
       });
       setContactOutcomeDraft({ orderId, channel });
     } catch (error) {
-      console.warn('Failed to record contact event', error);
+      if (!offlineActor) {
+        console.warn('Failed to record contact event', error);
+        return;
+      }
+      await queueContactEvent({
+        actor: offlineActor,
+        packageId: orderId,
+        method: channel,
+        outcome: 'ATTEMPTED',
+        observedServerRevision: orders.find((order: any) => order.id === orderId)?.updatedAt || orders.find((order: any) => order.id === orderId)?.updated_at || null
+      });
+      setContactOutcomeDraft({ orderId, channel });
+      setOfflineNotice('Contact event saved locally. WAITING TO SYNC until the server confirms it.');
+      await refreshOfflineState();
     }
   };
 
@@ -155,13 +222,24 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
         outcome
       });
     } catch (error) {
-      console.warn('Failed to record contact outcome', error);
+      if (offlineActor) {
+        await queueContactEvent({
+          actor: offlineActor,
+          packageId: contactOutcomeDraft.orderId,
+          method: contactOutcomeDraft.channel,
+          outcome,
+          observedServerRevision: orders.find((order: any) => order.id === contactOutcomeDraft.orderId)?.updatedAt || orders.find((order: any) => order.id === contactOutcomeDraft.orderId)?.updated_at || null
+        });
+        setOfflineNotice('Contact outcome saved locally. WAITING TO SYNC until the server confirms it.');
+        await refreshOfflineState();
+      } else {
+        console.warn('Failed to record contact outcome', error);
+      }
     } finally {
       setContactOutcomeDraft(null);
     }
   };
 
-  // Status Categorizations
   const activeRouteOrders = orders.filter((o: any) => {
     const st = (o.operationalStatus || o.operational_status || o.current_status || '').toLowerCase().replace(/[\s-]+/g, '_');
     return ['assigned', 'picked_up', 'out_for_delivery', 'rider_scanned', 'rider_accepted', 'ready_for_dispatch'].includes(st);
@@ -195,7 +273,6 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
     return attempts.length > 0 || hasNextAttempt || isRescheduled || isUnavailable;
   });
 
-  // Calculate COD metrics safely (never relying on string matching gateway names)
   const codToCollect = activeRouteOrders.reduce((sum: number, o: any) => {
     const cod = o.cod_expected !== undefined ? o.cod_expected : (o.codExpected || 0);
     const isPrepaid = (o.payment_method || o.paymentMethod || '').toLowerCase() === 'prepaid' || cod === 0;
@@ -207,10 +284,8 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
     return sum + Number(amt);
   }, 0);
 
-  // Uncontacted active stops
   const uncontactedCount = activeRouteOrders.filter((o: any) => !contactedOrderIds.has(o.id)).length;
 
-  // Filtered active orders for search
   const filteredActiveOrders = activeRouteOrders.filter((o: any) => {
     if (!search.trim()) return true;
     const q = search.toLowerCase();
@@ -220,9 +295,14 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
     return pkgId.includes(q) || cust.includes(q) || addr.includes(q);
   });
 
-  // Pick next delivery from active route orders (sorted by routeSequence or order)
   const nextDelivery = filteredActiveOrders.length > 0 ? filteredActiveOrders[0] : null;
   const remainingDeliveries = filteredActiveOrders.length > 1 ? filteredActiveOrders.slice(1) : [];
+  const syncStatusLabel = syncConflictCount > 0
+    ? 'ORDER CHANGED WHILE OFFLINE'
+    : syncFailedCount > 0
+    ? `ONLINE — ${syncFailedCount} UPDATES FAILED`
+    : buildOfflineBannerText({ isOnline: !isOffline, pendingCount: unsyncedCount });
+  const syncAlertTone = syncConflictCount > 0 ? 'warning' : isOffline || unsyncedCount > 0 ? 'offline' : 'online';
 
   if (loading) {
     return (
@@ -235,48 +315,40 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
 
   return (
     <div className="min-h-screen bg-[#F5F4F2] text-[#1F1F1D] flex flex-col font-sans max-w-md mx-auto border-x border-[#DDD9D4] shadow-xl relative pb-20 select-none">
-      
-      {/* 1. TOP HEADER */}
       <RiderHeader
         userProfile={userProfile}
         riderInfo={riderInfo}
         activeRun={activeRun}
         activeCount={activeRouteOrders.length}
+        syncStatusLabel={syncStatusLabel}
+        syncAlertTone={syncAlertTone}
         onAcceptShift={handleAcceptShift}
         isAcceptingShift={isAcceptingShift}
       />
 
-      {(isOffline || unsyncedCount > 0) && (
+      {(offlineNotice || isOffline || unsyncedCount > 0) && (
         <div className="bg-amber-100 border-b border-amber-300 px-4 py-2 text-[11px] font-bold text-amber-900">
-          {isOffline ? 'Offline mode: showing cached route data.' : 'Online'}
-          {unsyncedCount > 0 ? ` Unsynced actions pending: ${unsyncedCount}.` : ''}
+          {offlineNotice || (isOffline ? 'Offline mode: showing cached route data.' : 'WAITING TO SYNC')}
+          {unsyncedCount > 0 ? ` ${unsyncedCount} update${unsyncedCount === 1 ? '' : 's'} waiting.` : ''}
         </div>
       )}
 
-      {/* 2. PERSISTENT RETURN WARNING ALERT (Sticks if returns exist across any tab) */}
       {returnPackages.length > 0 && activeTab !== 'returns' && (
-        <div 
+        <div
           onClick={() => setActiveTab('returns')}
           className="bg-rose-600 text-white px-4 py-2.5 flex items-center justify-between text-xs font-black cursor-pointer shadow-xs active:opacity-90 transition sticky top-[68px] z-20"
         >
           <div className="flex items-center space-x-2">
             <AlertTriangle className="w-4 h-4 animate-bounce" />
-            <span>RETURN TO HUB — {returnPackages.length} PACKAGE{returnPackages.length === 1 ? '' : 'S'}</span>
+            <span>RETURN TO HUB â€” {returnPackages.length} PACKAGE{returnPackages.length === 1 ? '' : 'S'}</span>
           </div>
-          <span className="bg-white text-rose-800 text-[10px] uppercase font-black px-2 py-0.5 rounded-md">
-            View
-          </span>
+          <span className="bg-white text-rose-800 text-[10px] uppercase font-black px-2 py-0.5 rounded-md">View</span>
         </div>
       )}
 
-      {/* 3. MAIN TAB CONTENT */}
       <main className="p-4 space-y-4 flex-1">
-        
-        {/* TAB 1: ROUTE & HOME */}
         {activeTab === 'route' && (
           <div className="space-y-4">
-            
-            {/* HOME DASHBOARD SUMMARY */}
             <RiderHomeSummary
               assignedCount={orders.length}
               deliveredCount={completedOrders.length}
@@ -291,7 +363,6 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
               onNavigateTab={(tab) => setActiveTab(tab)}
             />
 
-            {/* SEARCH & REFRESH BAR */}
             <div className="flex items-center space-x-2">
               <div className="relative flex-1">
                 <Search className="w-4 h-4 text-[#6D6964] absolute left-3 top-3" />
@@ -313,7 +384,6 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
               </button>
             </div>
 
-            {/* PROMINENT NEXT STOP OR ROUTE COMPLETE FLOW */}
             {nextDelivery ? (
               <RiderNextStopCard
                 order={nextDelivery}
@@ -327,24 +397,21 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
                 riderInfo={riderInfo}
                 userProfile={userProfile}
                 activeRun={activeRun}
+                offlineActor={offlineActor}
                 onRefreshData={loadAllRiderData}
                 onLogout={onLogout}
                 onCloseFlow={() => setActiveTab('route')}
               />
             )}
 
-            {/* REMAINING DELIVERIES LIST */}
             {remainingDeliveries.length > 0 && (
               <div className="space-y-2.5 pt-2">
                 <div className="flex items-center justify-between px-1">
                   <h4 className="text-[11px] font-extrabold uppercase text-[#6D6964] tracking-wider">
                     Upcoming Deliveries ({remainingDeliveries.length})
                   </h4>
-                  <span className="text-[11px] text-[#6D6964] font-mono">
-                    {remainingDeliveries.length} Stops Left
-                  </span>
+                  <span className="text-[11px] text-[#6D6964] font-mono">{remainingDeliveries.length} Stops Left</span>
                 </div>
-
                 <div className="space-y-2.5">
                   {remainingDeliveries.map((ord: any, idx: number) => (
                     <RiderPackageCard
@@ -358,11 +425,9 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
                 </div>
               </div>
             )}
-
           </div>
         )}
 
-        {/* TAB 2: REATTEMPTS */}
         {activeTab === 'reattempts' && (
           <RiderReattemptsTab
             orders={orders}
@@ -371,7 +436,6 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
           />
         )}
 
-        {/* TAB 3: CASH */}
         {activeTab === 'cash' && (
           <RiderCashTab
             orders={orders}
@@ -380,43 +444,43 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
           />
         )}
 
-        {/* TAB 4: RETURNS */}
         {activeTab === 'returns' && (
           <RiderReturnsTab
             orders={orders}
+            offlineActor={offlineActor}
             onRefreshData={handleRefresh}
             onNavigateToCash={() => setActiveTab('cash')}
           />
         )}
 
-        {/* TAB 5: PROFILE */}
         {activeTab === 'profile' && (
           <RiderProfileTab
             userProfile={userProfile}
             riderInfo={riderInfo}
             onLogout={onLogout}
+            unsyncedCount={unsyncedCount}
           />
         )}
 
-        {/* TAB 6: DEDICATED END OF DAY FLOW */}
         {activeTab === 'end-of-day' && (
           <RiderEndOfDayFlow
             orders={orders}
             riderInfo={riderInfo}
             userProfile={userProfile}
             activeRun={activeRun}
+            offlineActor={offlineActor}
             onRefreshData={loadAllRiderData}
             onLogout={onLogout}
             onCloseFlow={() => setActiveTab('route')}
           />
         )}
-
       </main>
 
-      {/* 4. CONTROLLED OUTCOME MODAL (With double-submission lock & validation) */}
       {selectedOrderForAttempt && (
         <RiderDeliveryAttemptModal
           order={selectedOrderForAttempt}
+          offlineActor={offlineActor}
+          observedServerRevision={selectedOrderForAttempt.updatedAt || selectedOrderForAttempt.updated_at || null}
           onClose={() => setSelectedOrderForAttempt(null)}
           onSuccess={async () => {
             setSelectedOrderForAttempt(null);
@@ -453,9 +517,7 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
         </div>
       )}
 
-      {/* 5. STICKY MOBILE BOTTOM NAVIGATION BAR (Min 44px touch targets) */}
       <nav className="fixed bottom-0 left-0 right-0 max-w-md mx-auto bg-white border-t border-[#DDD9D4] h-16 flex items-center justify-around z-40 shadow-xl">
-        {/* Route Tab */}
         <button
           onClick={() => setActiveTab('route')}
           className={`flex-1 h-full flex flex-col items-center justify-center space-y-1 transition active:scale-95 ${
@@ -466,7 +528,6 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
           <span className="text-[10px]">Route</span>
         </button>
 
-        {/* Reattempts Tab */}
         <button
           onClick={() => setActiveTab('reattempts')}
           className={`flex-1 h-full flex flex-col items-center justify-center space-y-1 relative transition active:scale-95 ${
@@ -484,7 +545,6 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
           <span className="text-[10px]">Reattempts</span>
         </button>
 
-        {/* Cash Tab */}
         <button
           onClick={() => setActiveTab('cash')}
           className={`flex-1 h-full flex flex-col items-center justify-center space-y-1 transition active:scale-95 ${
@@ -495,7 +555,6 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
           <span className="text-[10px]">Cash</span>
         </button>
 
-        {/* Returns Tab */}
         <button
           onClick={() => setActiveTab('returns')}
           className={`flex-1 h-full flex flex-col items-center justify-center space-y-1 relative transition active:scale-95 ${
@@ -513,7 +572,6 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
           <span className="text-[10px]">Returns</span>
         </button>
 
-        {/* Profile Tab */}
         <button
           onClick={() => setActiveTab('profile')}
           className={`flex-1 h-full flex flex-col items-center justify-center space-y-1 transition active:scale-95 ${
@@ -524,7 +582,6 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
           <span className="text-[10px]">Profile</span>
         </button>
       </nav>
-
     </div>
   );
 }

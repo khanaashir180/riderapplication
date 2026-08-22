@@ -11,14 +11,16 @@ import {
 } from 'lucide-react';
 import { Order, Package, formatOperationalStatus } from '../../types';
 import { api } from '../../services/api';
+import { OfflineActor, queueHandbackPreparation } from '../../services/offline_store';
 
 interface RiderReturnsTabProps {
   orders: (Order | Package)[];
+  offlineActor?: OfflineActor | null;
   onRefreshData?: () => void;
   onNavigateToCash?: () => void;
 }
 
-export function RiderReturnsTab({ orders, onRefreshData, onNavigateToCash }: RiderReturnsTabProps) {
+export function RiderReturnsTab({ orders, offlineActor, onRefreshData, onNavigateToCash }: RiderReturnsTabProps) {
   // Returns to Hub: packages in failed/exception states or explicit return status
   const returnPackages = orders.filter((o: any) => {
     const st = (o.operationalStatus || o.current_status || '').toLowerCase().replace(/[\s-]+/g, '_');
@@ -88,8 +90,24 @@ export function RiderReturnsTab({ orders, onRefreshData, onNavigateToCash }: Rid
         setErrMsg(res?.error?.message || 'Failed to submit return handback.');
       }
     } catch (e: any) {
-      console.error('Handback error:', e);
-      setErrMsg(e.message || 'Error connecting to server.');
+      if (offlineActor) {
+        await queueHandbackPreparation({
+          actor: offlineActor,
+          packageId: selectedPkgForHandback.id,
+          scannedPackageNumber: scannedBarcode.trim(),
+          returnReason: selectedPkgForHandback.failure_reason || selectedPkgForHandback.failureReason || 'Failed Delivery Return',
+          riderNotes: handbackNotes.trim() || undefined,
+          handoffEmployee: handoffEmployee.trim() || undefined,
+          observedServerRevision: selectedPkgForHandback.updatedAt || selectedPkgForHandback.updated_at || null,
+          idempotencyKey
+        });
+        setSuccessMsg(`Package ${scannedBarcode} saved locally. WAITING TO SYNC until the server confirms the handback.`);
+        setSelectedPkgForHandback(null);
+        if (onRefreshData) onRefreshData();
+      } else {
+        console.error('Handback error:', e);
+        setErrMsg(e.message || 'Error connecting to server.');
+      }
     } finally {
       setIsSubmittingHandback(false);
     }

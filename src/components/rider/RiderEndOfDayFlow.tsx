@@ -20,12 +20,14 @@ import {
 } from 'lucide-react';
 import { Order, Package, Profile, Rider, formatOperationalStatus } from '../../types';
 import { api } from '../../services/api';
+import { OfflineActor, queueHandbackPreparation } from '../../services/offline_store';
 
 interface RiderEndOfDayFlowProps {
   orders: (Order | Package)[];
   riderInfo?: Rider | null;
   userProfile: Profile;
   activeRun?: any | null;
+  offlineActor?: OfflineActor | null;
   onRefreshData: () => Promise<void>;
   onLogout?: () => void;
   onCloseFlow?: () => void;
@@ -38,6 +40,7 @@ export function RiderEndOfDayFlow({
   riderInfo,
   userProfile,
   activeRun,
+  offlineActor,
   onRefreshData,
   onLogout,
   onCloseFlow
@@ -222,7 +225,24 @@ export function RiderEndOfDayFlow({
         setHandbackErrMsg(res?.error?.message || 'Failed to submit return handback.');
       }
     } catch (e: any) {
-      setHandbackErrMsg(e.message || 'Error connecting to server.');
+      if (offlineActor) {
+        await queueHandbackPreparation({
+          actor: offlineActor,
+          packageId: pkg.id,
+          scannedPackageNumber: barcodeInput.trim(),
+          returnReason: pkg.failure_reason || pkg.failureReason || 'Failed Delivery Return',
+          riderNotes: handbackNotes.trim() || undefined,
+          handoffEmployee: handoffEmployee.trim() || undefined,
+          observedServerRevision: pkg.updatedAt || pkg.updated_at || null,
+          idempotencyKey
+        });
+        setHandbackSuccessMsg(`Package ${barcodeInput.trim()} saved locally. WAITING TO SYNC until the server confirms the handback.`);
+        setSelectedPkgForHandback(null);
+        setQuickBarcodeInput('');
+        await onRefreshData();
+      } else {
+        setHandbackErrMsg(e.message || 'Error connecting to server.');
+      }
     } finally {
       setIsSubmittingHandback(false);
     }

@@ -1,0 +1,16 @@
+{
+  "name": "Gomila Rider Control",
+  "short_name": "Gomila Rider",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#f5f4f2",
+  "theme_color": "#5a2628",
+  "description": "Offline-capable rider route operations with queued sync.",
+  "icons": [
+    {
+      "src": "/favicon.ico",
+      "sizes": "48x48 64x64",
+      "type": "image/x-icon"
+    }
+  ]
+}

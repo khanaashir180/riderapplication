@@ -18,6 +18,7 @@ import { Order, Package } from '../../types';
 import { api } from '../../services/api';
 import { storage, auth } from '../../lib/firebase';
 import { ref, uploadBytes } from 'firebase/storage';
+import { OfflineActor, queueDeliveryAttempt } from '../../services/offline_store';
 
 type DeliveryOutcomeType = 
   | 'DELIVERED'
@@ -29,12 +30,16 @@ type DeliveryOutcomeType =
 
 interface RiderDeliveryAttemptModalProps {
   order: Order | Package;
+  offlineActor?: OfflineActor | null;
+  observedServerRevision?: string | null;
   onClose: () => void;
   onSuccess: () => void;
 }
 
 export function RiderDeliveryAttemptModal({
   order,
+  offlineActor,
+  observedServerRevision,
   onClose,
   onSuccess
 }: RiderDeliveryAttemptModalProps) {
@@ -67,6 +72,56 @@ export function RiderDeliveryAttemptModal({
   // Submission state
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const queueAttemptLocally = async (params: {
+    attemptId: string;
+    idempotencyKey: string;
+    effectiveReason: string;
+    proofStoragePath?: string;
+  }) => {
+    if (!offlineActor) {
+      throw new Error('Offline queue unavailable for this rider session.');
+    }
+
+    const payload: any = {
+      packageId: order.id,
+      status: selectedOutcome,
+      attemptId: params.attemptId,
+      idempotencyKey: params.idempotencyKey,
+      collectedAmount: selectedOutcome === 'DELIVERED' ? (isPrepaid ? 0 : Number(collectedAmount)) : 0,
+      paymentMethod: selectedOutcome === 'DELIVERED' ? (isPrepaid ? 'Prepaid' : paymentMethod) : undefined,
+      digitalReference: digitalReference.trim() || undefined,
+      receiverName: selectedOutcome === 'DELIVERED' ? receiverName.trim() : undefined,
+      receiverRelationship: selectedOutcome === 'DELIVERED' ? receiverRelationship : undefined,
+      reason: selectedOutcome !== 'DELIVERED' ? params.effectiveReason : undefined,
+      riderNotes: additionalNotes.trim() || params.effectiveReason || undefined,
+      newDeliveryDate: selectedOutcome === 'RESCHEDULED' ? `${rescheduleDate} (${timeSlot})` : undefined,
+      proofStoragePath: params.proofStoragePath,
+      latitude: gpsCoords.lat ?? null,
+      longitude: gpsCoords.lng ?? null,
+      deviceTimestamp: new Date().toISOString()
+    };
+
+    await queueDeliveryAttempt({
+      actor: offlineActor,
+      packageId: order.id,
+      payload,
+      observedServerRevision: observedServerRevision || order.updatedAt || (order as any).updated_at || null,
+      idempotencyKey: params.idempotencyKey,
+      localProof: selectedOutcome === 'DELIVERED' && proofImage
+        ? {
+            attemptId: params.attemptId,
+            fileName: proofFile?.name || `${pkgId}.jpg`,
+            fileType: proofFile?.type || 'image/jpeg',
+            fileSize: proofFile?.size || proofImage.length,
+            imageDataUrl: proofImage,
+            latitude: gpsCoords.lat ?? null,
+            longitude: gpsCoords.lng ?? null
+          }
+        : null
+    });
+    onSuccess();
+  };
 
   // Auto-fetch GPS on mount
   useEffect(() => {
@@ -169,7 +224,7 @@ export function RiderDeliveryAttemptModal({
 
     try {
       let proofStoragePath: string | undefined;
-      if (selectedOutcome === 'DELIVERED' && proofFile) {
+      if (selectedOutcome === 'DELIVERED' && proofFile && typeof navigator !== 'undefined' && navigator.onLine) {
         const riderUid = auth.currentUser?.uid;
         if (!riderUid) {
           throw new Error('Authentication session missing for proof upload.');
@@ -201,6 +256,16 @@ export function RiderDeliveryAttemptModal({
         deviceTimestamp: new Date().toISOString()
       };
 
+      if (typeof navigator !== 'undefined' && !navigator.onLine) {
+        await queueAttemptLocally({
+          attemptId,
+          idempotencyKey,
+          effectiveReason,
+          proofStoragePath
+        });
+        return;
+      }
+
       const res = await api.recordDeliveryAttempt(payload);
 
       if (res && res.success !== false) {
@@ -211,8 +276,22 @@ export function RiderDeliveryAttemptModal({
         setIsSubmitting(false);
       }
     } catch (err: any) {
-      console.error('Delivery submission error:', err);
-      setErrorMessage(err.message || 'Network error occurred while submitting attempt.');
+      if (offlineActor) {
+        try {
+          await queueAttemptLocally({
+            attemptId,
+            idempotencyKey,
+            effectiveReason
+          });
+          return;
+        } catch (queueError: any) {
+          console.error('Delivery queue fallback error:', queueError);
+          setErrorMessage(queueError.message || 'Unable to save delivery attempt offline.');
+        }
+      } else {
+        console.error('Delivery submission error:', err);
+        setErrorMessage(err.message || 'Network error occurred while submitting attempt.');
+      }
       setIsSubmitting(false);
     }
   };

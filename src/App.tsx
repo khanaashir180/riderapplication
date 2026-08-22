@@ -1,6 +1,7 @@
 import React, { useState } from 'react';
 import { UserRole, Profile } from './types';
 import { AuthProvider, useAuth } from './context/AuthContext';
+import { hasUnsyncedOfflineActions } from './services/offline_store';
 
 import { LoginScreen } from './components/auth/LoginScreen';
 import { Header } from './components/common/Header';
@@ -29,6 +30,22 @@ function AppContent() {
   
   const [selectedOrderId, setSelectedOrderId] = useState<string | null>(null);
   const [ordersFilterStatus, setOrdersFilterStatus] = useState<string>('');
+
+  const guardedSignOut = async () => {
+    if (profile?.role === 'rider' && rider?.id) {
+      const hasPending = await hasUnsyncedOfflineActions({
+        uid: profile.id,
+        riderId: rider.id,
+        profileId: profile.id,
+        fullName: profile.full_name
+      }).catch(() => false);
+      if (hasPending) {
+        alert('Logout blocked: offline rider updates are still WAITING TO SYNC.');
+        return;
+      }
+    }
+    await signOut();
+  };
 
   if (loading) {
     return (
@@ -62,7 +79,7 @@ function AppContent() {
               </div>
             </div>
             <button
-              onClick={() => signOut()}
+              onClick={() => guardedSignOut()}
               className="w-full py-2.5 bg-[#5A2628] text-white rounded-xl font-bold text-xs hover:bg-[#471D1F] transition flex items-center justify-center space-x-2"
             >
               <LogOut className="w-4 h-4" />
@@ -78,7 +95,7 @@ function AppContent() {
         <div className="w-full max-w-md flex justify-between items-center mb-3 px-2">
           <span className="text-xs font-bold text-[#5A2628]">Gomila Rider Mobile</span>
           <button
-            onClick={() => signOut()}
+            onClick={() => guardedSignOut()}
             className="text-xs text-[#6D6964] hover:text-[#1F1F1D] flex items-center space-x-1 font-semibold"
           >
             <LogOut className="w-3.5 h-3.5" />
@@ -87,7 +104,7 @@ function AppContent() {
         </div>
 
         <div className="w-full max-w-md shadow-2xl rounded-2xl overflow-hidden border border-[#DDD9D4] bg-white">
-          <RiderMobileShell userProfile={profile} />
+          <RiderMobileShell userProfile={profile} onLogout={guardedSignOut} />
         </div>
       </div>
     );
@@ -147,7 +164,7 @@ function AppContent() {
             />
           </div>
           <button
-            onClick={() => signOut()}
+            onClick={() => guardedSignOut()}
             title="Sign Out"
             className="p-2 text-[#6D6964] hover:text-[#B43B3B] hover:bg-stone-100 rounded-lg transition text-xs font-bold flex items-center space-x-1"
           >
@@ -202,7 +219,7 @@ function AppContent() {
             <ErrorBoundary fallbackTitle="Rider App Error">
               <div className="p-4 flex justify-center bg-[#DDD9D4]/30 min-h-screen">
                 <div className="w-full max-w-md shadow-2xl rounded-2xl overflow-hidden border border-[#DDD9D4] bg-[#F5F4F2]">
-                  <RiderMobileShell userProfile={profile} />
+                  <RiderMobileShell userProfile={profile} onLogout={guardedSignOut} />
                 </div>
               </div>
             </ErrorBoundary>

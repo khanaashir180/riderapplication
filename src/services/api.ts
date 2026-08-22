@@ -391,6 +391,8 @@ export const api = {
   async recordDeliveryAttempt(payload: {
     packageId: string;
     status: string;
+    attemptId?: string;
+    idempotencyKey?: string;
     collectedAmount?: number;
     paymentMethod?: string;
     receiverName?: string;
@@ -641,6 +643,10 @@ export const api = {
   async getManagementDrilldown(key: string, filters: ManagementFilters = {}): Promise<ApiResponse<ManagementDrilldownResponse>> {
     const params = new URLSearchParams({ ...(filters as Record<string, string>), key });
     return request<ManagementDrilldownResponse>(`/api/management/drilldown?${params.toString()}`);
+  },
+
+  async getManagementEod(filters: ManagementFilters = {}): Promise<ApiResponse<any>> {
+    return request<any>(`/api/management/eod?${new URLSearchParams(filters as Record<string, string>).toString()}`);
   },
 
   // Shopify Direct Integration

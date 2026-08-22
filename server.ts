@@ -10,6 +10,7 @@ import { getFirestore } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
 import { getStorage } from "firebase-admin/storage";
 import { processOMSImportRows, calculateSHA256, buildPackageDocumentId } from "./src/services/csvImporter.js";
+import { approveCodAllocationAuthority, assignPackageAuthority, recordDeliveryAttemptAuthority, transferAssignmentAuthority } from "./src/services/logisticsAuthority.js";
 import { createLogisticsRouter } from "./src/server/logisticsRouter.js";
 import { createAdminUserRouter, AdminUserTestHooks } from "./src/server/adminUserRouter.js";
 import { createShopifyRouter } from "./src/server/shopifyRouter.js";
@@ -1389,124 +1390,17 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
     }
 
     try {
-      await db.runTransaction(async (transaction) => {
-        const revRef = db.collection("codAllocationReviews").doc(reviewId);
-        const revDoc = await transaction.get(revRef);
-
-        if (!revDoc.exists) {
-          throw new Error("COD Allocation Review record not found");
-        }
-
-        const revData = revDoc.data();
-        if (revData?.status === "Approved") {
-          throw new Error("Review has already been approved");
-        }
-
-        const remainingBalance = revData?.remainingBalance ?? revData?.remaining_balance ?? 0;
-        const activePkgNumbers: string[] = revData?.activePackageNumbers || [];
-
-        // Validate allocations
-        const seenPkgIds = new Set<string>();
-        let totalAllocated = 0;
-
-        for (const alloc of allocations) {
-          const allocAmount = alloc.allocatedCod ?? alloc.allocated_cod ?? 0;
-          if (allocAmount < 0) {
-            throw new Error("Allocation amount cannot be negative");
-          }
-          totalAllocated += allocAmount;
-
-          if (typeof alloc.packageId !== "string" || !alloc.packageId.trim()) {
-            throw new Error("Every allocation must include a packageId.");
-          }
-          const pkgDocId = alloc.packageId.trim();
-
-          if (seenPkgIds.has(pkgDocId)) {
-            throw new Error(`Duplicate allocation for package ${pkgDocId}`);
-          }
-          seenPkgIds.add(pkgDocId);
-
-          const pkgRef = db.collection("packages").doc(pkgDocId);
-          const pkgDoc = await transaction.get(pkgRef);
-
-          if (!pkgDoc.exists) {
-            throw new Error(`Package ${pkgDocId} does not exist`);
-          }
-
-          const pkgData = pkgDoc.data();
-          const docPkgId = pkgData?.packageId || pkgData?.id;
-          if (docPkgId && docPkgId !== pkgDocId) {
-            throw new Error(`Package document packageId mismatch for ${pkgDocId}`);
-          }
-
-          const allocPkgNum = alloc.packageNumber || alloc.package_number;
-          if (allocPkgNum) {
-            const docPkgNum = pkgData?.packageNumber || pkgData?.package_number;
-            if (docPkgNum && docPkgNum !== allocPkgNum) {
-              throw new Error(`Package number mismatch for package ${pkgDocId}`);
-            }
-          }
-          const pkgNum = allocPkgNum || pkgData?.packageNumber || pkgData?.package_number || pkgDocId;
-          if (pkgData?.parentOrderNumber !== revData?.parentOrderNumber && pkgData?.parent_order_number !== revData?.parent_order_number) {
-            throw new Error(`Package ${pkgNum} does not belong to review parent order`);
-          }
-
-          if (pkgData?.operationalStatus !== "dispatched" && pkgData?.current_status !== "dispatched") {
-            throw new Error(`Package ${pkgNum} is not in dispatched status`);
-          }
-
-          if (pkgData?.importState !== "committed") {
-            throw new Error(`Package ${pkgNum} is not committed`);
-          }
-
-          transaction.update(pkgRef, {
-            expectedCod: allocAmount,
-            codExpected: allocAmount,
-            cod_expected: allocAmount,
-            requiresCodReview: false,
-            requires_cod_review: false,
-            updatedAt: new Date().toISOString()
-          });
-
-          const allocRef = db.collection("codAllocations").doc();
-          transaction.set(allocRef, {
-            id: allocRef.id,
-            reviewId,
-            packageId: pkgDocId,
-            packageNumber: pkgNum,
-            allocatedCod: allocAmount,
-            createdByUid: req.auth.uid,
-            createdAt: new Date().toISOString()
-          });
-        }
-
-        if (Math.abs(totalAllocated - remainingBalance) > 0.01) {
-          throw new Error(`Allocation sum (${totalAllocated}) does not equal parent balance (${remainingBalance})`);
-        }
-
-        if (activePkgNumbers.length > 0 && seenPkgIds.size !== activePkgNumbers.length) {
-          throw new Error(`Incomplete allocations: expected ${activePkgNumbers.length} packages, got ${seenPkgIds.size}`);
-        }
-
-        transaction.update(revRef, {
-          status: "Approved",
-          approvedByUid: req.auth.uid,
-          approvedAt: new Date().toISOString()
-        });
-
-        const auditRef = db.collection("auditEvents").doc();
-        transaction.set(auditRef, {
-          id: auditRef.id,
-          action: "COD_ALLOCATION_APPROVED",
-          reviewId,
-          approvedByUid: req.auth.uid,
-          timestamp: new Date().toISOString()
-        });
+      await approveCodAllocationAuthority({
+        db,
+        reviewId,
+        allocations,
+        actorUid: req.auth.uid
       });
 
       return res.json({ success: true, data: { message: "COD allocation approved atomically" } });
     } catch (err: any) {
-      return res.status(409).json({ success: false, error: { code: "TRANSACTION_FAILED", message: err.message } });
+      const status = err.status || 409;
+      return res.status(status).json({ success: false, error: { code: err.code || "TRANSACTION_FAILED", message: err.message } });
     }
   });
 
@@ -1521,94 +1415,13 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
     }
 
     try {
-      await db.runTransaction(async (transaction) => {
-        const pkgRef = db.collection("packages").doc(packageId);
-        const pkgDoc = await transaction.get(pkgRef);
-
-        if (!pkgDoc.exists) {
-          throw { code: "NOT_FOUND", status: 404, message: `Package ${packageId} not found` };
-        }
-
-        const pkgData = pkgDoc.data();
-        if (pkgData?.importState !== "committed") {
-          throw { code: "FAILED_PRECONDITION", status: 400, message: "Package is not committed" };
-        }
-
-        const rawChannel = (pkgData?.deliveryChannel || pkgData?.delivery_channel || "").toLowerCase().replace(/[\s_]+/g, "");
-        if (rawChannel && !rawChannel.includes("internalrider") && rawChannel !== "internal") {
-          throw { code: "EXTERNAL_COURIER_ASSIGNMENT_REJECTED", status: 400, message: "External courier package cannot be assigned to internal rider." };
-        }
-
-        const currentStatus = (pkgData?.operationalStatus || pkgData?.current_status || "").toLowerCase();
-        if (["delivered", "returned", "cancelled", "closed"].includes(currentStatus)) {
-          throw { code: "INVALID_PACKAGE_STATUS", status: 400, message: `Delivered, returned, cancelled or closed package cannot be assigned. Status: ${currentStatus}` };
-        }
-
-        // Active assignment check on package
-        if (pkgData?.assignedRiderId) {
-          throw { code: "PACKAGE_ALREADY_ASSIGNED", status: 409, message: `Package ${packageId} is already assigned to rider ${pkgData.assignedRiderId}.` };
-        }
-
-        const riderRef = db.collection("riders").doc(riderId);
-        const riderDoc = await transaction.get(riderRef);
-        if (!riderDoc.exists) {
-          throw { code: "RIDER_NOT_FOUND", status: 404, message: `Rider ${riderId} not found` };
-        }
-
-        const riderData = riderDoc.data();
-        if (riderData?.active === false) {
-          throw { code: "RIDER_INACTIVE", status: 400, message: `Rider ${riderId} is inactive` };
-        }
-
-        // Capacity check
-        const activeSnap = await db.collection("assignments")
-          .where("riderId", "==", riderId)
-          .where("active", "==", true)
-          .get();
-
-        const maxCapacity = riderData?.maximum_daily_capacity || riderData?.maximumDailyCapacity || 50;
-        if (activeSnap.size >= maxCapacity) {
-          throw { code: "RIDER_CAPACITY_EXCEEDED", status: 400, message: `Rider ${riderId} maximum daily capacity of ${maxCapacity} reached` };
-        }
-
-        // Deterministic Active Lock Check
-        const lockRef = db.collection("assignments").doc(packageId);
-        const lockDoc = await transaction.get(lockRef);
-        if (lockDoc.exists && lockDoc.data()?.active === true) {
-          throw { code: "PACKAGE_ALREADY_ASSIGNED", status: 409, message: `Active assignment lock exists for package ${packageId}. Simultaneous double assignment rejected.` };
-        }
-
-        const nowStr = new Date().toISOString();
-        transaction.set(lockRef, {
-          id: packageId,
-          packageId,
-          riderId,
-          assignedBy: req.auth.uid,
-          assignedAt: nowStr,
-          active: true
-        });
-
-        transaction.update(pkgRef, {
-          assignedRiderId: riderId,
-          current_status: "Assigned",
-          operationalStatus: "assigned",
-          custodyStage: "assigned_to_rider",
-          custody_stage: "assigned_to_rider",
-          updatedAt: nowStr
-        });
-
-        const auditRef = db.collection("auditEvents").doc();
-        transaction.set(auditRef, {
-          id: auditRef.id,
-          action: "PACKAGE_ASSIGNED",
-          packageId,
-          riderId,
-          assignedByUid: req.auth.uid,
-          timestamp: nowStr
-        });
+      const result = await assignPackageAuthority({
+        db,
+        packageId,
+        riderId,
+        actorUid: req.auth.uid
       });
-
-      return res.json({ success: true, data: { packageId, riderId, assignedAt: new Date().toISOString() } });
+      return res.json({ success: true, data: result });
     } catch (err: any) {
       const status = err.status || 400;
       const code = err.code || "ASSIGNMENT_FAILED";
@@ -1742,9 +1555,9 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
 
   // --- DISPATCH TRANSFER CONTROLS ---
   app.post("/api/dispatch/transfer", requireAuth, requireAnyRole("super_admin", "dispatch_manager"), async (req: any, res: any) => {
-    const { packageId, sourceRiderId, destinationRiderId, transferReason, sourceConfirmed } = req.body;
-    if (!packageId || !sourceRiderId || !destinationRiderId) {
-      return res.status(400).json({ success: false, error: { code: "INVALID_ARGUMENT", message: "Missing packageId, sourceRiderId, or destinationRiderId" } });
+    const { packageId, destinationRiderId, transferReason } = req.body;
+    if (!packageId || !destinationRiderId) {
+      return res.status(400).json({ success: false, error: { code: "INVALID_ARGUMENT", message: "Missing packageId or destinationRiderId" } });
     }
 
     if (!transferReason || typeof transferReason !== "string" || !transferReason.trim()) {
@@ -1752,76 +1565,16 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
     }
 
     try {
-      await db.runTransaction(async (transaction) => {
-        const lockRef = db.collection("assignments").doc(packageId);
-        const lockDoc = await transaction.get(lockRef);
-
-        if (!lockDoc.exists || lockDoc.data()?.active !== true) {
-          throw { code: "NO_ACTIVE_ASSIGNMENT", status: 404, message: `No active assignment lock found for package ${packageId}` };
-        }
-
-        const currentLock = lockDoc.data();
-        if (currentLock?.riderId !== sourceRiderId) {
-          throw { code: "SOURCE_RIDER_MISMATCH", status: 403, message: "Source rider does not match current active assignment" };
-        }
-
-        const pkgRef = db.collection("packages").doc(packageId);
-        const pkgDoc = await transaction.get(pkgRef);
-        if (!pkgDoc.exists) {
-          throw { code: "NOT_FOUND", status: 404, message: `Package ${packageId} not found` };
-        }
-
-        const pkgData = pkgDoc.data();
-        const currentStatus = (pkgData?.operationalStatus || pkgData?.current_status || "").toLowerCase();
-        if (["delivered", "returned", "cancelled", "closed"].includes(currentStatus)) {
-          throw { code: "COMPLETED_PACKAGE", status: 400, message: "Completed package cannot be transferred" };
-        }
-
-        const destRiderRef = db.collection("riders").doc(destinationRiderId);
-        const destRiderDoc = await transaction.get(destRiderRef);
-        if (!destRiderDoc.exists || destRiderDoc.data()?.active === false) {
-          throw { code: "RIDER_INACTIVE", status: 400, message: `Destination rider ${destinationRiderId} is inactive or does not exist` };
-        }
-
-        const nowStr = new Date().toISOString();
-        // Atomic transfer: close old assignment, record transfer, update package
-        transaction.update(lockRef, {
-          active: false,
-          closedAt: nowStr,
-          closeReason: "transferred"
-        });
-
-        const newLockRef = db.collection("assignments").doc(`${packageId}_tr_${Date.now()}`);
-        transaction.set(newLockRef, {
-          id: newLockRef.id,
-          packageId,
-          riderId: destinationRiderId,
-          previousRiderId: sourceRiderId,
-          transferReason,
-          assignedBy: req.auth.uid,
-          assignedAt: nowStr,
-          active: true
-        });
-
-        transaction.update(pkgRef, {
-          assignedRiderId: destinationRiderId,
-          updatedAt: nowStr
-        });
-
-        const auditRef = db.collection("auditEvents").doc();
-        transaction.set(auditRef, {
-          id: auditRef.id,
-          action: "PACKAGE_TRANSFERRED",
-          packageId,
-          sourceRiderId,
-          destinationRiderId,
-          transferReason,
-          transferredByUid: req.auth.uid,
-          timestamp: nowStr
-        });
+      const result = await transferAssignmentAuthority({
+        db,
+        packageId,
+        destinationRiderId,
+        transferReason,
+        actorUid: req.auth.uid,
+        actorRole: req.auth.role,
+        actorRiderId: req.auth.riderId
       });
-
-      return res.json({ success: true, data: { packageId, destinationRiderId, transferredAt: new Date().toISOString() } });
+      return res.json({ success: true, data: result });
     } catch (err: any) {
       const status = err.status || 400;
       const code = err.code || "TRANSFER_FAILED";
@@ -2686,430 +2439,14 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
   });
 
   app.post("/api/delivery/attempt", requireAuth, requireExactRole("rider"), requirePackageOwnership, async (req: any, res: any) => {
-    const {
-      packageId,
-      status,
-      attemptId: customAttemptId,
-      deliveryAttemptId,
-      collectedAmount,
-      paymentMethod,
-      receiverName,
-      receiverRelationship,
-      deviceTimestamp,
-      latitude,
-      longitude,
-      proofImageUrl,
-      proofPhoto,
-      proofImage,
-      proofStoragePath,
-      gpsPermissionState,
-      proofStatus,
-      reason,
-      riderNotes,
-      newDeliveryDate,
-      idempotencyKey,
-      digitalReference
-    } = req.body;
-
-    if (!packageId || !status) {
-      return res.status(400).json({ success: false, error: { code: "INVALID_ARGUMENT", message: "Missing packageId or status" } });
-    }
-
-    const ALLOWED_OUTCOMES = ["DELIVERED", "CUSTOMER_UNAVAILABLE", "RESCHEDULED", "REFUSED", "ADDRESS_ISSUE", "CUSTOMER_CANCELLED"];
-    const rawOutcome = (status || "").toUpperCase().replace(/[\s-]+/g, "_");
-    if (!ALLOWED_OUTCOMES.includes(rawOutcome)) {
-      return res.status(400).json({
-        success: false,
-        error: { code: "INVALID_DELIVERY_OUTCOME", message: `Invalid delivery outcome "${status}". Allowed outcomes: ${ALLOWED_OUTCOMES.join(", ")}` }
-      });
-    }
-
-    const hasLat = isValidCoordinate(latitude, -90, 90);
-    const hasLng = isValidCoordinate(longitude, -180, 180);
-    const legacyProofPayload = [proofImageUrl, proofPhoto, proofImage].find((value) => typeof value === "string" && value.trim()) as string | undefined;
-    const storageProofPath = typeof proofStoragePath === "string" ? proofStoragePath.trim() : "";
-
-    if (legacyProofPayload && isDataUrl(legacyProofPayload)) {
-      return res.status(400).json({
-        success: false,
-        error: { code: "BASE64_PROOF_REJECTED", message: "Photo proof must be uploaded to Firebase Storage first; base64 payloads are rejected." }
-      });
-    }
-
-    if (rawOutcome === "DELIVERED") {
-      if (collectedAmount === undefined || collectedAmount === null || collectedAmount === "" || isNaN(Number(collectedAmount))) {
-        return res.status(400).json({ success: false, error: { code: "COLLECTED_AMOUNT_REQUIRED", message: "Delivered status requires actual collected amount." } });
-      }
-      if (Number(collectedAmount) < 0) {
-        return res.status(400).json({ success: false, error: { code: "NEGATIVE_COD_REJECTED", message: "Collected amount cannot be negative." } });
-      }
-      if (!receiverName || typeof receiverName !== "string" || !receiverName.trim()) {
-        return res.status(400).json({ success: false, error: { code: "RECEIVER_NAME_REQUIRED", message: "Delivered status requires receiverName." } });
-      }
-      if (!storageProofPath) {
-        return res.status(400).json({ success: false, error: { code: "PROOF_STORAGE_PATH_REQUIRED", message: "Delivered status requires a Firebase Storage proof path." } });
-      }
-    } else if (rawOutcome === "RESCHEDULED") {
-      if (!newDeliveryDate || typeof newDeliveryDate !== "string" || !newDeliveryDate.trim()) {
-        return res.status(400).json({ success: false, error: { code: "NEW_DELIVERY_DATE_REQUIRED", message: "Rescheduled status requires a new delivery date." } });
-      }
-    } else if (!reason || typeof reason !== "string" || !reason.trim()) {
-      return res.status(400).json({ success: false, error: { code: "REASON_REQUIRED", message: "Failed delivery outcome requires a reason." } });
-    }
-
-    const effectiveAttemptId = customAttemptId || deliveryAttemptId || `att_${crypto.randomUUID()}`;
-    const effectiveIdemKey = idempotencyKey || `DELIVERY:${packageId}:${effectiveAttemptId}`;
-    const nowStr = new Date().toISOString();
-
     try {
-      if (rawOutcome === "DELIVERED") {
-        await verifyDeliveryProofStorageObject({
-          uid: req.auth.uid,
-          attemptId: effectiveAttemptId,
-          proofStoragePath: storageProofPath
-        });
-      }
-
-      const result = await db.runTransaction(async (t: any) => {
-        const pkgRef = db.collection("packages").doc(packageId);
-        const pkgDoc = await t.get(pkgRef);
-        if (!pkgDoc.exists) {
-          throw { status: 404, code: "NOT_FOUND", message: `Package ${packageId} not found` };
-        }
-
-        const pkgData = pkgDoc.data();
-        const assignedRiderId = pkgData?.assignedRiderId;
-        if (req.auth.role === "rider" && assignedRiderId !== req.auth.riderId) {
-          throw { status: 403, code: "FORBIDDEN", message: "You are not assigned to this package. Rider completing unassigned package is strictly rejected." };
-        }
-
-        const idemRef = db.collection("idempotencyKeys").doc(effectiveIdemKey);
-        const idemDoc = await t.get(idemRef);
-        if (idemDoc.exists) {
-          const stored = idemDoc.data();
-          return { idempotent: true, data: stored?.attemptRecord || { packageId, status: rawOutcome } };
-        }
-
-        const currOpStatus = (pkgData?.operationalStatus || pkgData?.current_status || "").toUpperCase().replace(/[\s-]+/g, "_");
-        if (currOpStatus !== "OUT_FOR_DELIVERY") {
-          if (currOpStatus === "DELIVERED") {
-            throw { status: 400, code: "DUPLICATE_DELIVERY_SUBMISSION", message: "Package is already delivered. Duplicate delivery submission rejected." };
-          }
-          throw { status: 400, code: "INVALID_STATE_TRANSITION", message: `Cannot record delivery attempt for package in state "${currOpStatus}". Package must be OUT_FOR_DELIVERY.` };
-        }
-
-        let gpsExceptionRecord: any = null;
-        if (rawOutcome === "DELIVERED" && (!hasLat || !hasLng)) {
-          const gpsExceptionId = String(pkgData?.gpsExceptionId || "").trim();
-          if (!gpsExceptionId) {
-            throw { status: 400, code: "GPS_COORDINATES_REQUIRED", message: "Delivered status requires valid GPS coordinates unless a privileged GPS exception has already been approved." };
-          }
-          const gpsRef = db.collection("deliveryGpsExceptions").doc(gpsExceptionId);
-          const gpsDoc = await t.get(gpsRef);
-          if (!gpsDoc.exists) throw { status: 400, code: "GPS_EXCEPTION_NOT_FOUND", message: "Approved GPS exception record was not found." };
-          gpsExceptionRecord = gpsDoc.data();
-          const normalizedGpsStatus = String(gpsExceptionRecord?.status || "").toLowerCase();
-          const expiresAt = normalizeIsoDate(gpsExceptionRecord?.expiresAt);
-          if (normalizedGpsStatus !== "approved") throw { status: 400, code: "GPS_EXCEPTION_INVALID", message: "GPS exception is not currently approved." };
-          if (String(gpsExceptionRecord?.packageId || "") !== packageId) throw { status: 400, code: "GPS_EXCEPTION_PACKAGE_MISMATCH", message: "GPS exception does not belong to this package." };
-          if (expiresAt && Date.parse(nowStr) > Date.parse(expiresAt)) throw { status: 400, code: "GPS_EXCEPTION_EXPIRED", message: "GPS exception has expired and cannot be used." };
-          if (gpsExceptionRecord?.consumedAt || gpsExceptionRecord?.consumedAttemptId) {
-            throw { status: 409, code: "GPS_EXCEPTION_ALREADY_CONSUMED", message: "GPS exception has already been consumed by another attempt." };
-          }
-        }
-
-        const isPrepaid = (pkgData.paymentMethod || pkgData.payment_method || "").toLowerCase() === "prepaid" || Number(pkgData.expectedCod || pkgData.cod_expected || 0) === 0;
-        const expectedCod = isPrepaid ? 0 : Number(pkgData.cod_expected || pkgData.expectedCod || pkgData.codExpected || 0);
-        const collAmt = rawOutcome === "DELIVERED" ? (isPrepaid ? 0 : Number(collectedAmount)) : 0;
-        const normPayment = (paymentMethod || pkgData.paymentMethod || pkgData.payment_method || (isPrepaid ? "prepaid" : "cash")).toLowerCase().replace(/[\s_]+/g, "_");
-        const isDigital = ["jazzcash", "easypaisa", "bank_transfer"].includes(normPayment);
-
-        let normalizedDigitalReference: string | null = null;
-        if (rawOutcome === "DELIVERED" && isDigital) {
-          if (!digitalReference || !digitalReference.trim()) {
-            throw { status: 400, code: "DIGITAL_REFERENCE_REQUIRED", message: "Digital payment method requires a digital reference." };
-          }
-          normalizedDigitalReference = normalizeDigitalReference(digitalReference);
-          if (!normalizedDigitalReference) {
-            throw { status: 400, code: "DIGITAL_REFERENCE_REQUIRED", message: "Digital payment reference cannot be blank." };
-          }
-          const digRef = db.collection("digitalPaymentVerifications").doc(`dig_${normalizedDigitalReference}`);
-          const digDoc = await t.get(digRef);
-          if (digDoc.exists) {
-            const digData = digDoc.data();
-            if (digData?.packageId !== packageId) {
-              throw { status: 409, code: "DIGITAL_REFERENCE_ALREADY_USED", message: `Digital reference "${normalizedDigitalReference}" has already been used for another package.` };
-            }
-          }
-        }
-
-        const contactEventsQuery = db.collection("deliveryContactEvents")
-          .where("packageId", "==", packageId)
-          .where("riderId", "==", (req.auth.riderId || assignedRiderId))
-          .limit(1);
-        const contactEventsSnap = await t.get(contactEventsQuery);
-
-        const attemptRef = db.collection("deliveryAttempts").doc(effectiveAttemptId);
-        const attemptRecord = {
-          id: effectiveAttemptId,
-          packageId,
-          riderId: req.auth.riderId || assignedRiderId,
-          status: rawOutcome,
-          collectedAmount: collAmt,
-          paymentMethod: rawOutcome === "DELIVERED" ? (isPrepaid ? "Prepaid" : (paymentMethod || "Cash")) : null,
-          receiverName: rawOutcome === "DELIVERED" ? receiverName.trim() : null,
-          receiverRelationship: rawOutcome === "DELIVERED" ? (receiverRelationship?.trim() || "Recipient") : null,
-          latitude: hasLat ? Number(latitude) : null,
-          longitude: hasLng ? Number(longitude) : null,
-          proofImageUrl: null,
-          proofStoragePath: storageProofPath || null,
-          reason: reason || null,
-          riderNotes: riderNotes || null,
-          customerContacted: !contactEventsSnap.empty,
-          newDeliveryDate: rawOutcome === "RESCHEDULED" ? newDeliveryDate.trim() : null,
-          serverTimestamp: nowStr,
-          deviceTimestamp: deviceTimestamp || nowStr,
-          gpsPermissionState: hasLat && hasLng ? (gpsPermissionState || "granted") : (gpsPermissionState || "denied"),
-          proofStatus: proofStatus || (rawOutcome === "DELIVERED" ? "captured" : "pending"),
-          idempotencyKey: effectiveIdemKey,
-          createdAt: nowStr
-        };
-        t.set(attemptRef, attemptRecord);
-
-        let codCollectionRecord = null;
-        let txId: string | null = null;
-        let codCollectionId: string | null = null;
-        let collectionDiscrepancyId: string | null = null;
-
-        if (rawOutcome === "DELIVERED") {
-          t.update(pkgRef, {
-            current_status: "Delivered",
-            operationalStatus: "delivered",
-            collectedAmount: collAmt,
-            receiverName: receiverName.trim(),
-            deliveredAt: nowStr,
-            failureReason: null,
-            updatedAt: nowStr
-          });
-
-          if (!isPrepaid) {
-            codCollectionId = `cod_${crypto.randomUUID()}`;
-            const collectionVariance = collAmt - expectedCod;
-            let accountCode = "RIDER_CASH_WALLET";
-            if (normPayment === "jazzcash") accountCode = "JAZZCASH_CLEARING";
-            else if (normPayment === "easypaisa") accountCode = "EASYPAISA_CLEARING";
-            else if (normPayment === "bank_transfer") accountCode = "BANK_TRANSFER_CLEARING";
-
-            if (collAmt > 0) {
-              txId = `tx_${crypto.randomUUID()}`;
-              const txRef = db.collection("financialTransactions").doc(txId);
-              t.set(txRef, {
-                id: txId,
-                transactionType: "COD_COLLECTION",
-                sourceType: "cod_collection",
-                sourceId: packageId,
-                packageId,
-                riderId: req.auth.riderId || assignedRiderId,
-                cashierProfileId: null,
-                settlementId: null,
-                bankDepositId: null,
-                status: "posted",
-                currency: "PKR",
-                totalDebit: collAmt,
-                totalCredit: collAmt,
-                idempotencyKey: effectiveIdemKey,
-                createdByUid: req.auth.uid,
-                createdAt: nowStr,
-                reversedTransactionId: null,
-                reversedByUid: null,
-                reversedAt: null,
-                reversalReason: null
-              });
-
-              const postDebitRef = db.collection("financialPostings").doc(`post_dr_${crypto.randomUUID()}`);
-              t.set(postDebitRef, {
-                id: postDebitRef.id,
-                transactionId: txId,
-                accountCode,
-                debitAmount: collAmt,
-                creditAmount: 0,
-                packageId,
-                riderId: req.auth.riderId || assignedRiderId,
-                createdAt: nowStr
-              });
-
-              const postCreditRef = db.collection("financialPostings").doc(`post_cr_${crypto.randomUUID()}`);
-              t.set(postCreditRef, {
-                id: postCreditRef.id,
-                transactionId: txId,
-                accountCode: "CUSTOMER_COD_RECEIVABLE",
-                debitAmount: 0,
-                creditAmount: collAmt,
-                packageId,
-                riderId: req.auth.riderId || assignedRiderId,
-                createdAt: nowStr
-              });
-            }
-
-            codCollectionRecord = {
-              id: codCollectionId,
-              packageId,
-              riderId: req.auth.riderId || assignedRiderId,
-              expectedCod,
-              collectedAmount: collAmt,
-              paymentMethod: normPayment,
-              digitalReference: normalizedDigitalReference,
-              collectionVariance,
-              idempotencyKey: effectiveIdemKey,
-              transactionId: txId,
-              discrepancyId: null,
-              createdAt: nowStr,
-              updatedAt: nowStr
-            };
-
-            if (collectionVariance !== 0) {
-              collectionDiscrepancyId = `cod_disc_${crypto.randomUUID()}`;
-              codCollectionRecord.discrepancyId = collectionDiscrepancyId;
-              t.set(db.collection("codCollectionDiscrepancies").doc(collectionDiscrepancyId), {
-                id: collectionDiscrepancyId,
-                packageId,
-                riderId: req.auth.riderId || assignedRiderId,
-                expectedCod,
-                collectedAmount: collAmt,
-                variance: collectionVariance,
-                reason: null,
-                resolutionType: null,
-                status: "OPEN",
-                createdAt: nowStr,
-                approvedAt: null,
-                approvedByUid: null,
-                resolvedAt: null,
-                resolvedByUid: null,
-                settlementId: null
-              });
-            }
-
-            t.set(db.collection("codCollections").doc(codCollectionId), codCollectionRecord);
-
-            if (isDigital && normalizedDigitalReference) {
-              t.set(db.collection("digitalPaymentVerifications").doc(`dig_${normalizedDigitalReference}`), {
-                id: `dig_${normalizedDigitalReference}`,
-                digitalReference: normalizedDigitalReference,
-                packageId,
-                paymentMethod: normPayment,
-                amount: collAmt,
-                verificationStatus: "PENDING",
-                status: "pending",
-                verificationNote: null,
-                verifiedByUid: null,
-                verifiedAt: null,
-                createdAt: nowStr
-              });
-            }
-          }
-
-          const deliveryProofRef = db.collection("deliveryProofs").doc(`proof_${effectiveAttemptId}`);
-          t.set(deliveryProofRef, {
-            id: deliveryProofRef.id,
-            attemptId: effectiveAttemptId,
-            packageId,
-            riderId: req.auth.riderId || assignedRiderId,
-            proofStoragePath: storageProofPath,
-            latitude: hasLat ? Number(latitude) : null,
-            longitude: hasLng ? Number(longitude) : null,
-            capturedAt: deviceTimestamp || nowStr,
-            uploadedAt: nowStr,
-            receiverName: receiverName.trim(),
-            createdAt: nowStr
-          });
-
-          t.set(db.collection("auditLogs").doc(`audit_${crypto.randomUUID()}`), {
-            id: `audit_${crypto.randomUUID()}`,
-            action: "PACKAGE_DELIVERED",
-            packageId,
-            riderId: req.auth.riderId || assignedRiderId,
-            actorUid: req.auth.uid,
-            actorRole: req.auth.role,
-            metadata: {
-              attemptId: effectiveAttemptId,
-              collectedAmount: collAmt,
-              paymentMethod: normPayment,
-              txId,
-              collectionDiscrepancyId
-            },
-            timestamp: nowStr
-          });
-
-          if (gpsExceptionRecord) {
-            t.set(db.collection("deliveryGpsExceptions").doc(String(gpsExceptionRecord.id)), {
-              status: "consumed",
-              consumedAttemptId: effectiveAttemptId,
-              consumedAt: nowStr,
-              consumedByUid: req.auth.uid,
-              updatedAt: nowStr
-            }, { merge: true });
-            t.set(pkgRef, {
-              gpsExceptionApproved: false,
-              gpsExceptionId: null,
-              gpsExceptionApprovedAt: null,
-              gpsExceptionApprovedByUid: null,
-              gpsExceptionReason: null,
-              gpsExceptionExpiresAt: null
-            }, { merge: true });
-          }
-        } else {
-          let targetStatus = "Customer Unavailable";
-          let targetOpStatus = "customer_unavailable";
-          if (rawOutcome === "RESCHEDULED") { targetStatus = "Rescheduled"; targetOpStatus = "rescheduled"; }
-          else if (rawOutcome === "REFUSED") { targetStatus = "Refused"; targetOpStatus = "refused"; }
-          else if (rawOutcome === "ADDRESS_ISSUE") { targetStatus = "Incorrect Address"; targetOpStatus = "address_issue"; }
-          else if (rawOutcome === "CUSTOMER_CANCELLED") { targetStatus = "Cancelled"; targetOpStatus = "cancelled"; }
-
-          t.update(pkgRef, {
-            current_status: targetStatus,
-            operationalStatus: targetOpStatus,
-            failureReason: reason || null,
-            nextAttemptDate: rawOutcome === "RESCHEDULED" ? newDeliveryDate.trim() : null,
-            updatedAt: nowStr
-          });
-
-          t.set(db.collection("returns").doc(`ret_${packageId}`), {
-            id: `ret_${packageId}`,
-            packageId,
-            packageNumber: pkgData?.packageNumber || pkgData?.package_number || packageId,
-            riderId: req.auth.riderId || assignedRiderId,
-            returnReason: reason || rawOutcome,
-            returnStatus: "return_required",
-            createdAt: nowStr,
-            updatedAt: nowStr
-          }, { merge: true });
-
-          t.set(db.collection("auditLogs").doc(`audit_${crypto.randomUUID()}`), {
-            id: `audit_${crypto.randomUUID()}`,
-            action: `DELIVERY_FAILED_${rawOutcome}`,
-            packageId,
-            riderId: req.auth.riderId || assignedRiderId,
-            actorUid: req.auth.uid,
-            actorRole: req.auth.role,
-            metadata: { attemptId: effectiveAttemptId, reason, nextAttemptDate: newDeliveryDate },
-            timestamp: nowStr
-          });
-        }
-
-        t.set(idemRef, {
-          key: effectiveIdemKey,
-          packageId,
-          attemptId: effectiveAttemptId,
-          status: rawOutcome,
-          attemptRecord,
-          codCollectionRecord,
-          createdAt: nowStr
-        });
-
-        return { idempotent: false, data: attemptRecord };
+      const result = await recordDeliveryAttemptAuthority({
+        db,
+        auth: req.auth,
+        body: req.body,
+        verifyDeliveryProofStorageObject
       });
-
-      return res.json({ success: true, data: result.data });
+      return res.json({ success: true, data: result });
     } catch (err: any) {
       const status = err.status || 500;
       const code = err.code || "SERVER_ERROR";

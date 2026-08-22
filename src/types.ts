@@ -186,6 +186,7 @@ export interface Package {
   city: string;
   province?: string;
   zone?: string;
+  subZone?: string;
   latitude?: number;
   longitude?: number;
   customerNotes?: string;
@@ -205,6 +206,9 @@ export interface Package {
   assignedRiderId?: string | null;
   dispatchRunId?: string | null;
   routeSequence?: number;
+  customerDeliveryWindow?: string;
+  reattemptPriority?: number;
+  highValue?: boolean;
 
   locked?: boolean;
   lockReason?: string;
@@ -360,6 +364,7 @@ export function normalizePackage(raw: any): Package {
     city,
     province: prov || undefined,
     zone: zone || undefined,
+    subZone: raw.subZone || raw.sub_zone || raw.assignedSubZone || undefined,
     latitude: raw.latitude,
     longitude: raw.longitude,
     customerNotes: raw.customerNotes || raw.customer_notes || raw.specialInstructions || raw.deliveryInstructions || '',
@@ -376,6 +381,9 @@ export function normalizePackage(raw: any): Package {
     assignedRiderId,
     dispatchRunId,
     routeSequence: raw.routeSequence,
+    customerDeliveryWindow: raw.customerDeliveryWindow || raw.customer_delivery_window,
+    reattemptPriority: raw.reattemptPriority || raw.reattempt_priority,
+    highValue: raw.highValue || Number(codExpected) > 15000,
     locked: raw.locked || false,
     lockReason: raw.lockReason || raw.lock_reason,
     importState,
@@ -471,7 +479,10 @@ export interface Rider {
   vehicle_type?: 'Motorbike' | 'Cargo Rickshaw' | 'Van' | 'Bicycle';
   registration_number?: string;
   maximum_daily_capacity?: number;
+  maximum_cod_exposure?: number;
   assigned_zone?: string;
+  allowed_zones?: string[];
+  active_shift?: string | null;
   active?: boolean;
   profile?: Profile;
   assigned_count?: number;
