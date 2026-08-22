@@ -60,6 +60,38 @@ export interface AnalyticsSummary {
   };
 }
 
+export interface ManagementMetric {
+  key: string;
+  label: string;
+  value: number | null;
+  unit?: "count" | "currency" | "percent" | "text";
+  displayValue: string;
+  source: string;
+  formula?: string;
+  drilldownKey?: string;
+  status?: "normal" | "warning" | "critical" | "na";
+}
+
+export interface ManagementFilters {
+  datePreset?: "today" | "yesterday" | "custom";
+  fromDate?: string;
+  toDate?: string;
+  city?: string;
+  zone?: string;
+  riderId?: string;
+  paymentType?: string;
+  source?: string;
+  courier?: string;
+  shift?: string;
+}
+
+export interface ManagementDrilldownResponse {
+  key: string;
+  title: string;
+  columns: Array<{ key: string; label: string }>;
+  rows: any[];
+}
+
 export type ApiResponse<T> = {
   success: boolean;
   data?: T;
@@ -380,7 +412,8 @@ export const api = {
   async recordDeliveryContactEvent(payload: {
     packageId: string;
     method: 'CALL' | 'WHATSAPP';
-    outcome: 'ANSWERED' | 'NO_ANSWER' | 'PHONE_OFF' | 'INVALID_NUMBER' | 'CALLBACK_REQUESTED';
+    outcome: 'ATTEMPTED' | 'ANSWERED' | 'NO_ANSWER' | 'PHONE_OFF' | 'INVALID_NUMBER' | 'CALLBACK_REQUESTED';
+    attemptId?: string;
     notes?: string;
   }): Promise<ApiResponse<any>> {
     return request<any>("/api/delivery/contact-events", {
@@ -475,6 +508,24 @@ export const api = {
     });
   },
 
+  async getDigitalPaymentVerifications(): Promise<ApiResponse<any[]>> {
+    return request<any[]>("/api/finance/digital-payments");
+  },
+
+  async verifyDigitalPayment(payload: {
+    digitalReference: string;
+    packageId: string;
+    amount: number;
+    paymentChannel: string;
+    verificationStatus: 'PENDING' | 'VERIFIED' | 'MISMATCH' | 'REJECTED';
+    verificationNote?: string;
+  }): Promise<ApiResponse<any>> {
+    return request<any>("/api/finance/digital-payments/verify", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
+
   async closeSettlement(payload: { settlementId: string }): Promise<ApiResponse<any>> {
     return request<any>("/api/finance/settlements/close", {
       method: "POST",
@@ -561,6 +612,35 @@ export const api = {
   // Analytics
   async getAnalyticsSummary(): Promise<ApiResponse<AnalyticsSummary>> {
     return request<AnalyticsSummary>("/api/analytics/summary");
+  },
+
+  async getManagementOverview(filters: ManagementFilters = {}): Promise<ApiResponse<any>> {
+    return request<any>(`/api/management/overview?${new URLSearchParams(filters as Record<string, string>).toString()}`);
+  },
+
+  async getManagementRiders(filters: ManagementFilters = {}): Promise<ApiResponse<any>> {
+    return request<any>(`/api/management/riders?${new URLSearchParams(filters as Record<string, string>).toString()}`);
+  },
+
+  async getManagementFinance(filters: ManagementFilters = {}): Promise<ApiResponse<any>> {
+    return request<any>(`/api/management/finance?${new URLSearchParams(filters as Record<string, string>).toString()}`);
+  },
+
+  async getManagementReturns(filters: ManagementFilters = {}): Promise<ApiResponse<any>> {
+    return request<any>(`/api/management/returns?${new URLSearchParams(filters as Record<string, string>).toString()}`);
+  },
+
+  async getManagementExceptions(filters: ManagementFilters = {}): Promise<ApiResponse<any>> {
+    return request<any>(`/api/management/exceptions?${new URLSearchParams(filters as Record<string, string>).toString()}`);
+  },
+
+  async getManagementActivity(filters: ManagementFilters = {}): Promise<ApiResponse<any>> {
+    return request<any>(`/api/management/activity?${new URLSearchParams(filters as Record<string, string>).toString()}`);
+  },
+
+  async getManagementDrilldown(key: string, filters: ManagementFilters = {}): Promise<ApiResponse<ManagementDrilldownResponse>> {
+    const params = new URLSearchParams({ ...(filters as Record<string, string>), key });
+    return request<ManagementDrilldownResponse>(`/api/management/drilldown?${params.toString()}`);
   },
 
   // Shopify Direct Integration

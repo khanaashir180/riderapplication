@@ -669,27 +669,51 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
   // 5. POST /api/shopify/order - Direct webhook / single order ingestion (SECURE)
   router.post("/order", async (req: any, res: any) => {
     try {
-      const secretHeader = req.headers["x-gomila-integration-secret"] || req.headers["x-integration-secret"] || req.headers["x-shopify-hmac-sha256"];
-      const configuredSecret = (process.env.SHOPIFY_INTEGRATION_SECRET || "").trim();
+      const makeSecretHeader = req.headers["x-gomila-integration-secret"] || req.headers["x-integration-secret"];
+      const shopifyHmacHeader = req.headers["x-shopify-hmac-sha256"];
+      const configuredMakeSecret = (process.env.SHOPIFY_INTEGRATION_SECRET || "").trim();
+      const configuredShopifyWebhookSecret = (process.env.SHOPIFY_WEBHOOK_SECRET || "").trim();
 
-      if (!configuredSecret) {
-        return res.status(503).json({
-          success: false,
-          error: {
-            code: "SHOPIFY_SECRET_NOT_CONFIGURED",
-            message: "SHOPIFY_INTEGRATION_SECRET is not configured. Shopify ingestion is disabled."
-          }
-        });
-      }
-
-      if (!timingSafeSecretMatch(secretHeader, configuredSecret)) {
-        return res.status(401).json({
-          success: false,
-          error: {
-            code: "UNAUTHORIZED_INTEGRATION_REQUEST",
-            message: "Missing or invalid integration secret key. Webhook rejected."
-          }
-        });
+      if (typeof shopifyHmacHeader === "string" && shopifyHmacHeader.trim()) {
+        if (!configuredShopifyWebhookSecret) {
+          return res.status(503).json({
+            success: false,
+            error: {
+              code: "SHOPIFY_WEBHOOK_SECRET_NOT_CONFIGURED",
+              message: "SHOPIFY_WEBHOOK_SECRET is not configured. Shopify webhook ingestion is disabled."
+            }
+          });
+        }
+        const rawBody = Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(JSON.stringify(req.body || {}));
+        const expectedHmac = crypto.createHmac("sha256", configuredShopifyWebhookSecret).update(rawBody).digest("base64");
+        if (!timingSafeSecretMatch(shopifyHmacHeader, expectedHmac)) {
+          return res.status(401).json({
+            success: false,
+            error: {
+              code: "INVALID_SHOPIFY_HMAC",
+              message: "Shopify webhook HMAC verification failed."
+            }
+          });
+        }
+      } else {
+        if (!configuredMakeSecret) {
+          return res.status(503).json({
+            success: false,
+            error: {
+              code: "SHOPIFY_SECRET_NOT_CONFIGURED",
+              message: "SHOPIFY_INTEGRATION_SECRET is not configured. Make ingestion is disabled."
+            }
+          });
+        }
+        if (!timingSafeSecretMatch(makeSecretHeader, configuredMakeSecret)) {
+          return res.status(401).json({
+            success: false,
+            error: {
+              code: "UNAUTHORIZED_INTEGRATION_REQUEST",
+              message: "Missing or invalid Gomila integration secret. Webhook rejected."
+            }
+          });
+        }
       }
 
       const rawOrder = req.body?.order || req.body;

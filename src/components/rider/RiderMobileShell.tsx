@@ -12,6 +12,7 @@ import {
 } from 'lucide-react';
 import { Profile, Rider, Order, Package } from '../../types';
 import { api } from '../../services/api';
+import { cacheRiderOrders, getCachedRiderOrders, getUnsyncedQueueItems } from '../../services/offline_store';
 import { RiderHeader } from './RiderHeader';
 import { RiderHomeSummary } from './RiderHomeSummary';
 import { RiderNextStopCard } from './RiderNextStopCard';
@@ -43,10 +44,30 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
 
   // Set of contacted order IDs during this session
   const [contactedOrderIds, setContactedOrderIds] = useState<Set<string>>(new Set());
+  const [contactOutcomeDraft, setContactOutcomeDraft] = useState<{ orderId: string; channel: 'CALL' | 'WHATSAPP' } | null>(null);
+  const [isOffline, setIsOffline] = useState<boolean>(typeof navigator !== 'undefined' ? !navigator.onLine : false);
+  const [unsyncedCount, setUnsyncedCount] = useState(0);
 
   useEffect(() => {
     loadAllRiderData();
   }, []);
+
+  useEffect(() => {
+    const onOnline = () => setIsOffline(false);
+    const onOffline = () => setIsOffline(true);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+    void refreshOfflineState();
+    return () => {
+      window.removeEventListener('online', onOnline);
+      window.removeEventListener('offline', onOffline);
+    };
+  }, []);
+
+  const refreshOfflineState = async () => {
+    const pending = await getUnsyncedQueueItems().catch(() => []);
+    setUnsyncedCount(Array.isArray(pending) ? pending.length : 0);
+  };
 
   const loadAllRiderData = async () => {
     setLoading(true);
@@ -62,7 +83,9 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
       const rawOrders = Array.isArray(ordRes) 
         ? ordRes 
         : (ordRes?.orders || ordRes?.data?.orders || ordRes?.data || []);
-      setOrders(Array.isArray(rawOrders) ? rawOrders : []);
+      const normalizedOrders = Array.isArray(rawOrders) ? rawOrders : [];
+      setOrders(normalizedOrders);
+      await cacheRiderOrders(normalizedOrders);
 
       // 3. Load Active Dispatch Run
       try {
@@ -75,7 +98,12 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
       }
     } catch (e) {
       console.error('Failed to load rider route data:', e);
+      const cachedOrders = await getCachedRiderOrders().catch(() => []);
+      if (Array.isArray(cachedOrders) && cachedOrders.length > 0) {
+        setOrders(cachedOrders);
+      }
     } finally {
+      await refreshOfflineState();
       setLoading(false);
       setIsRefreshing(false);
     }
@@ -110,10 +138,26 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
       await api.recordDeliveryContactEvent({
         packageId: orderId,
         method: channel,
-        outcome: channel === 'CALL' ? 'NO_ANSWER' : 'CALLBACK_REQUESTED'
+        outcome: 'ATTEMPTED'
       });
+      setContactOutcomeDraft({ orderId, channel });
     } catch (error) {
       console.warn('Failed to record contact event', error);
+    }
+  };
+
+  const handleContactOutcome = async (outcome: 'ANSWERED' | 'NO_ANSWER' | 'PHONE_OFF' | 'INVALID_NUMBER' | 'CALLBACK_REQUESTED') => {
+    if (!contactOutcomeDraft) return;
+    try {
+      await api.recordDeliveryContactEvent({
+        packageId: contactOutcomeDraft.orderId,
+        method: contactOutcomeDraft.channel,
+        outcome
+      });
+    } catch (error) {
+      console.warn('Failed to record contact outcome', error);
+    } finally {
+      setContactOutcomeDraft(null);
     }
   };
 
@@ -121,6 +165,11 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
   const activeRouteOrders = orders.filter((o: any) => {
     const st = (o.operationalStatus || o.operational_status || o.current_status || '').toLowerCase().replace(/[\s-]+/g, '_');
     return ['assigned', 'picked_up', 'out_for_delivery', 'rider_scanned', 'rider_accepted', 'ready_for_dispatch'].includes(st);
+  }).sort((a: any, b: any) => {
+    const aSeq = Number.isFinite(Number(a.routeSequence)) ? Number(a.routeSequence) : Number.MAX_SAFE_INTEGER;
+    const bSeq = Number.isFinite(Number(b.routeSequence)) ? Number(b.routeSequence) : Number.MAX_SAFE_INTEGER;
+    if (aSeq !== bSeq) return aSeq - bSeq;
+    return String(a.packageNumber || a.package_number || a.id).localeCompare(String(b.packageNumber || b.package_number || b.id));
   });
 
   const completedOrders = orders.filter((o: any) => {
@@ -196,6 +245,13 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
         onAcceptShift={handleAcceptShift}
         isAcceptingShift={isAcceptingShift}
       />
+
+      {(isOffline || unsyncedCount > 0) && (
+        <div className="bg-amber-100 border-b border-amber-300 px-4 py-2 text-[11px] font-bold text-amber-900">
+          {isOffline ? 'Offline mode: showing cached route data.' : 'Online'}
+          {unsyncedCount > 0 ? ` Unsynced actions pending: ${unsyncedCount}.` : ''}
+        </div>
+      )}
 
       {/* 2. PERSISTENT RETURN WARNING ALERT (Sticks if returns exist across any tab) */}
       {returnPackages.length > 0 && activeTab !== 'returns' && (
@@ -367,6 +423,34 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
             await loadAllRiderData();
           }}
         />
+      )}
+
+      {contactOutcomeDraft && (
+        <div className="fixed inset-0 z-50 bg-black/40 flex items-end justify-center p-4">
+          <div className="w-full max-w-md bg-white rounded-2xl border border-[#DDD9D4] p-4 space-y-3 shadow-2xl">
+            <div>
+              <p className="text-xs font-black uppercase tracking-wider text-[#6D6964]">Contact Outcome</p>
+              <h3 className="text-sm font-black text-[#1F1F1D] mt-1">Record the real result of this {contactOutcomeDraft.channel.toLowerCase()} attempt</h3>
+            </div>
+            <div className="grid grid-cols-2 gap-2">
+              {(['ANSWERED', 'NO_ANSWER', 'PHONE_OFF', 'INVALID_NUMBER', 'CALLBACK_REQUESTED'] as const).map((outcome) => (
+                <button
+                  key={outcome}
+                  onClick={() => handleContactOutcome(outcome)}
+                  className="rounded-xl border border-[#DDD9D4] px-3 py-3 text-xs font-bold text-[#1F1F1D] hover:bg-[#F5F4F2]"
+                >
+                  {outcome.replace(/_/g, ' ')}
+                </button>
+              ))}
+            </div>
+            <button
+              onClick={() => setContactOutcomeDraft(null)}
+              className="w-full rounded-xl bg-[#5A2628] px-3 py-3 text-xs font-bold text-white"
+            >
+              Record Later
+            </button>
+          </div>
+        </div>
       )}
 
       {/* 5. STICKY MOBILE BOTTOM NAVIGATION BAR (Min 44px touch targets) */}

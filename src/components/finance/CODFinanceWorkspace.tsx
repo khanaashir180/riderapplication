@@ -9,6 +9,7 @@ interface CODFinanceWorkspaceProps {
 
 export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) {
   const [settlements, setSettlements] = useState<RiderSettlement[]>([]);
+  const [digitalPayments, setDigitalPayments] = useState<any[]>([]);
   const [riders, setRiders] = useState<Rider[]>([]);
   const [courierShipments, setCourierShipments] = useState<ExternalCourierShipment[]>([]);
   const [loading, setLoading] = useState(true);
@@ -27,14 +28,16 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
   const loadFinanceData = async () => {
     setLoading(true);
     try {
-      const [stlRes, rdrRes, curRes] = await Promise.all([
+      const [stlRes, rdrRes, curRes, digRes] = await Promise.all([
         api.getRiderSettlements(),
         api.getRiders(),
-        api.getExternalCourierShipments()
+        api.getExternalCourierShipments(),
+        api.getDigitalPaymentVerifications()
       ]);
       setSettlements(stlRes.data || (Array.isArray(stlRes) ? stlRes : []));
       setRiders(rdrRes.riders || rdrRes.data || (Array.isArray(rdrRes) ? rdrRes : []));
       setCourierShipments(curRes.data || (Array.isArray(curRes) ? curRes : []));
+      setDigitalPayments(digRes.data || (Array.isArray(digRes) ? digRes : []));
     } catch (e) {
       console.error('Failed to load finance data:', e);
     } finally {
@@ -57,21 +60,17 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
     setIsProcessing(true);
     try {
       if (action === 'receive' || action === 'approve') {
-        const res = await api.receiveCashierSettlement({
+        await api.receiveCashierSettlement({
           settlementId: selectedSettlement.id,
           physicallyReceivedAmount: cashierReceived,
           receiptNotes: discrepancyNotes
         });
-
-        if (res.data && res.data.status === 'discrepancy' && discrepancyNotes) {
+        if (action === 'approve') {
           await api.approveSettlementDiscrepancy({
             settlementId: selectedSettlement.id,
             discrepancyReason: discrepancyNotes,
             resolutionType: 'APPROVED_WRITE_OFF',
             resolutionReason: discrepancyNotes
-          });
-          await api.closeSettlement({
-            settlementId: selectedSettlement.id
           });
         }
       }
@@ -128,7 +127,10 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
                   <th className="p-3 text-right">Expected Cash</th>
                   <th className="p-3 text-right">Rider Declaration</th>
                   <th className="p-3 text-right">Cashier Receipt</th>
-                  <th className="p-3 text-right">Difference</th>
+                  <th className="p-3 text-right">Collection Var.</th>
+                  <th className="p-3 text-right">Handover Var.</th>
+                  <th className="p-3 text-right">Cashier Var.</th>
+                  <th className="p-3 text-right">Total Var.</th>
                   <th className="p-3">Stage</th>
                   <th className="p-3">Responsible User</th>
                   <th className="p-3 text-right">Action</th>
@@ -137,7 +139,7 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
               <tbody className="divide-y divide-[#DDD9D4]">
                 {activeSettlementsList.length === 0 ? (
                   <tr>
-                    <td colSpan={9} className="p-8 text-center text-xs text-[#6D6964]">
+                    <td colSpan={12} className="p-8 text-center text-xs text-[#6D6964]">
                       No settlement records match the current view.
                     </td>
                   </tr>
@@ -146,7 +148,10 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
                     const expected = stl.calculatedCashObligation ?? 0;
                     const declared = stl.declaredCashAmount ?? 0;
                     const received = stl.physicallyReceivedAmount ?? 0;
-                    const variance = stl.totalSettlementVariance ?? (received - expected);
+                    const collectionVariance = stl.collectionVariance ?? 0;
+                    const handoverVariance = stl.riderHandoverVariance ?? 0;
+                    const cashierVariance = stl.cashierVariance ?? 0;
+                    const variance = stl.totalSettlementVariance ?? (collectionVariance + handoverVariance + cashierVariance);
                     const hasDiscrepancy = variance !== 0;
 
                     return (
@@ -166,6 +171,9 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
                         <td className="p-3 text-right font-mono">
                           Rs. {received.toLocaleString()}
                         </td>
+                        <td className="p-3 text-right font-mono">{collectionVariance.toLocaleString()}</td>
+                        <td className="p-3 text-right font-mono">{handoverVariance.toLocaleString()}</td>
+                        <td className="p-3 text-right font-mono">{cashierVariance.toLocaleString()}</td>
                         <td className={`p-3 text-right font-mono font-bold ${
                           hasDiscrepancy ? 'text-[#B43B3B]' : 'text-[#6D6964]'
                         }`}>
@@ -229,7 +237,47 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
       )}
 
       {/* DIGITAL & BANK DEPOSITS TABS */}
-      {(activeSubTab === 'digital' || activeSubTab === 'deposits') && (
+      {activeSubTab === 'digital' && (
+        <div className="bg-white rounded-lg border border-[#DDD9D4] p-4 space-y-3">
+          <h3 className="font-bold text-xs uppercase text-[#6D6964]">Digital Verification Pending</h3>
+          {digitalPayments.length === 0 ? (
+            <div className="p-6 text-center text-xs text-[#6D6964]">No digital payment verifications found.</div>
+          ) : (
+            digitalPayments.map((payment) => (
+              <div key={payment.id} className="rounded-xl border border-[#DDD9D4] p-3 flex items-center justify-between text-xs">
+                <div>
+                  <p className="font-bold text-[#1F1F1D]">{payment.digitalReference}</p>
+                  <p className="text-[#6D6964]">{payment.packageId} · {payment.paymentMethod} · Rs. {Number(payment.amount || 0).toLocaleString()}</p>
+                </div>
+                <div className="flex gap-2">
+                  {(['VERIFIED', 'MISMATCH', 'REJECTED'] as const).map((status) => (
+                    <button
+                      key={status}
+                      onClick={async () => {
+                        const note = status === 'VERIFIED' ? '' : window.prompt(`Enter note for ${status.toLowerCase()}`, '') || '';
+                        await api.verifyDigitalPayment({
+                          digitalReference: payment.digitalReference,
+                          packageId: payment.packageId,
+                          amount: Number(payment.amount || 0),
+                          paymentChannel: payment.paymentMethod,
+                          verificationStatus: status,
+                          verificationNote: note || undefined
+                        });
+                        await loadFinanceData();
+                      }}
+                      className="rounded-lg border border-[#DDD9D4] px-2 py-1 font-bold"
+                    >
+                      {status}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ))
+          )}
+        </div>
+      )}
+
+      {activeSubTab === 'deposits' && (
         <div className="bg-white rounded-lg border border-[#DDD9D4] p-8 text-center text-xs text-[#6D6964]">
           All bank slips & verified digital wallet transactions are reconciled against daily cashier receipts.
         </div>

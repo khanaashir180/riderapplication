@@ -72,16 +72,22 @@ export function RiderCashTab({ orders, riderId, onRefreshData }: RiderCashTabPro
   };
 
   // Cash Already Submitted to Cashier (sum of declared or received amounts in submitted/received/closed settlements)
-  const cashAlreadySubmitted = settlements.reduce((sum: number, s: any) => {
+  const handoverSubmitted = settlements.reduce((sum: number, s: any) => {
     if (s.status !== 'rejected') {
-      const val = s.physicallyReceivedAmount > 0 ? s.physicallyReceivedAmount : (s.declaredCashAmount || 0);
-      return sum + Number(val);
+      return sum + Number(s.declaredCashAmount || 0);
     }
     return sum;
   }, 0);
 
-  // Cash Currently With You
-  const cashCurrentlyWithYou = Math.max(0, cashCollected - cashAlreadySubmitted);
+  const cashierConfirmed = settlements.reduce((sum: number, s: any) => {
+    if (s.status !== 'rejected') {
+      return sum + Number(s.physicallyReceivedAmount || 0);
+    }
+    return sum;
+  }, 0);
+
+  const cashCurrentlyWithYou = Math.max(0, cashCollected - cashierConfirmed);
+  const outstandingCash = Math.max(0, cashCollected - cashierConfirmed);
 
   const handleOpenHandover = () => {
     setHandoverAmount(cashCurrentlyWithYou);
@@ -143,10 +149,10 @@ export function RiderCashTab({ orders, riderId, onRefreshData }: RiderCashTabPro
           <span className="text-3xl font-black font-mono text-amber-400 block">
             Rs. {cashCurrentlyWithYou.toLocaleString()}
           </span>
-          <span className="text-[11px] text-stone-200">
-            Physical cash currently held by rider
-          </span>
-        </div>
+            <span className="text-[11px] text-stone-200">
+            Physical cash still unconfirmed by cashier
+            </span>
+          </div>
 
         {/* 4 Financial Breakdown Metrics */}
         <div className="grid grid-cols-2 gap-2 text-xs pt-1">
@@ -166,8 +172,18 @@ export function RiderCashTab({ orders, riderId, onRefreshData }: RiderCashTabPro
           </div>
 
           <div className="bg-white/10 p-2.5 rounded-xl border border-white/10 space-y-0.5">
-            <span className="text-[10px] text-stone-300 block">Already Submitted</span>
-            <span className="font-bold text-amber-300 font-mono">Rs. {cashAlreadySubmitted.toLocaleString()}</span>
+            <span className="text-[10px] text-stone-300 block">Handover Submitted</span>
+            <span className="font-bold text-amber-300 font-mono">Rs. {handoverSubmitted.toLocaleString()}</span>
+          </div>
+
+          <div className="bg-white/10 p-2.5 rounded-xl border border-white/10 space-y-0.5">
+            <span className="text-[10px] text-stone-300 block">Cashier Confirmed</span>
+            <span className="font-bold text-sky-300 font-mono">Rs. {cashierConfirmed.toLocaleString()}</span>
+          </div>
+
+          <div className="bg-white/10 p-2.5 rounded-xl border border-white/10 space-y-0.5">
+            <span className="text-[10px] text-stone-300 block">Outstanding Cash</span>
+            <span className="font-bold text-rose-300 font-mono">Rs. {outstandingCash.toLocaleString()}</span>
           </div>
         </div>
 

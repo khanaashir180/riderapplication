@@ -8,10 +8,12 @@ import { createServer as createViteServer } from "vite";
 import { initializeApp, getApps } from "firebase-admin/app";
 import { getFirestore } from "firebase-admin/firestore";
 import { getAuth } from "firebase-admin/auth";
+import { getStorage } from "firebase-admin/storage";
 import { processOMSImportRows, calculateSHA256, buildPackageDocumentId } from "./src/services/csvImporter.js";
 import { createLogisticsRouter } from "./src/server/logisticsRouter.js";
 import { createAdminUserRouter, AdminUserTestHooks } from "./src/server/adminUserRouter.js";
 import { createShopifyRouter } from "./src/server/shopifyRouter.js";
+import { createManagementRouter } from "./src/server/managementRouter.js";
 
 const PORT = 3000;
 
@@ -34,6 +36,7 @@ if (!getApps().length) {
 }
 
 const adminAuth = getAuth();
+const adminStorage = getStorage();
 
 // Get Firestore DB instance using default database
 const db = getFirestore();
@@ -360,6 +363,93 @@ function buildSettlementResolutionPostings(settlement: any, resolutionType: stri
   throw { status: 400, code: "INVALID_RESOLUTION_TYPE", message: `Resolution type "${resolutionType}" is not valid for an excess.` };
 }
 
+const DIGITAL_PAYMENT_STATUSES = ["PENDING", "VERIFIED", "MISMATCH", "REJECTED"] as const;
+const COLLECTION_DISCREPANCY_REASONS = [
+  "CUSTOMER_SHORT_PAYMENT_APPROVED",
+  "ORDER_VALUE_CORRECTION",
+  "DISCOUNT_CORRECTION",
+  "RIDER_UNDERCOLLECTION",
+  "RIDER_OVERCOLLECTION",
+  "SYSTEM_ERROR"
+] as const;
+
+function normalizeIsoDate(value: unknown) {
+  if (typeof value !== "string" || !value.trim()) return null;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? new Date(parsed).toISOString() : null;
+}
+
+function buildCollectionDiscrepancyStatus(details: {
+  collectionVariance: number;
+  riderHandoverVariance: number;
+  cashierVariance: number;
+  unresolvedCollectionDiscrepancyCount: number;
+}) {
+  const totalSettlementVariance = Number(details.collectionVariance || 0) + Number(details.riderHandoverVariance || 0) + Number(details.cashierVariance || 0);
+  const unresolvedCollectionVariance = Number(details.unresolvedCollectionDiscrepancyCount || 0) > 0;
+  const requiresResolution = unresolvedCollectionVariance || totalSettlementVariance !== 0;
+  const discrepancyType = unresolvedCollectionVariance
+    ? "COLLECTION_VARIANCE"
+    : totalSettlementVariance < 0
+      ? "SHORT"
+      : totalSettlementVariance > 0
+        ? "EXCESS"
+        : Number(details.cashierVariance || 0) !== 0
+          ? "DECLARATION_MISMATCH"
+          : "NONE";
+  return {
+    totalSettlementVariance,
+    unresolvedCollectionVariance,
+    requiresResolution,
+    discrepancyType
+  };
+}
+
+async function verifyDeliveryProofStorageObject(params: {
+  uid: string;
+  attemptId: string;
+  proofStoragePath: string;
+}) {
+  const normalizedPath = String(params.proofStoragePath || "").trim();
+  if (!normalizedPath) {
+    throw { status: 400, code: "PROOF_STORAGE_PATH_REQUIRED", message: "Delivered status requires a Firebase Storage proof path." };
+  }
+
+  const expectedPrefix = `deliveryProofs/${params.uid}/${params.attemptId}/`;
+  if (!normalizedPath.startsWith(expectedPrefix)) {
+    throw {
+      status: 400,
+      code: "INVALID_PROOF_STORAGE_PATH",
+      message: `Proof storage path must start with "${expectedPrefix}".`
+    };
+  }
+
+  const allowedTypes = new Set(["image/jpeg", "image/png", "image/webp", "image/heic", "image/heif"]);
+  const maxBytes = 10 * 1024 * 1024;
+
+  try {
+    const bucket = adminStorage.bucket();
+    const file = bucket.file(normalizedPath);
+    const [exists] = await file.exists();
+    if (!exists) {
+      throw { status: 400, code: "PROOF_FILE_NOT_FOUND", message: "Uploaded delivery proof file does not exist in Storage." };
+    }
+    const [metadata] = await file.getMetadata();
+    const contentType = String(metadata.contentType || "").toLowerCase();
+    const size = Number(metadata.size || 0);
+    if (!allowedTypes.has(contentType)) {
+      throw { status: 400, code: "INVALID_PROOF_CONTENT_TYPE", message: `Proof content type "${contentType || "unknown"}" is not allowed.` };
+    }
+    if (!(size > 0) || size > maxBytes) {
+      throw { status: 400, code: "INVALID_PROOF_FILE_SIZE", message: "Proof file size is invalid or exceeds the permitted limit." };
+    }
+    return { contentType, size };
+  } catch (err: any) {
+    if (err?.code) throw err;
+    throw { status: 500, code: "PROOF_STORAGE_VALIDATION_FAILED", message: err.message || "Unable to validate delivery proof in Storage." };
+  }
+}
+
 async function createDoubleEntryTransaction(db: any, params: {
   transactionType: string;
   sourceType: string;
@@ -512,7 +602,10 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
   );
 
   // Large payload parsers specifically for CSV / Batch Import routes
-  const largeJsonParser = express.json({ limit: "50mb" });
+  const jsonVerify = (req: any, _res: any, buf: Buffer) => {
+    req.rawBody = Buffer.from(buf);
+  };
+  const largeJsonParser = express.json({ limit: "50mb", verify: jsonVerify });
   const largeUrlencodedParser = express.urlencoded({ extended: true, limit: "50mb" });
   app.use(
     ["/api/import", "/api/import-batches", "/api/logistics/import"],
@@ -521,7 +614,7 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
   );
 
   // Default global body limits (2mb)
-  app.use(express.json({ limit: "2mb" }));
+  app.use(express.json({ limit: "2mb", verify: jsonVerify }));
   app.use(express.urlencoded({ extended: true, limit: "2mb" }));
 
   // Security Rate Limiters
@@ -2517,11 +2610,11 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
 
   // --- DELIVERY ATTEMPTS & OUTCOMES ---
   app.post("/api/delivery/contact-events", requireAuth, requireExactRole("rider"), requirePackageOwnership, async (req: any, res: any) => {
-    const { packageId, method, outcome, notes } = req.body || {};
+    const { packageId, method, outcome, notes, attemptId } = req.body || {};
     const normalizedMethod = String(method || "").toUpperCase();
-    const normalizedOutcome = String(outcome || "").toUpperCase();
+    const normalizedOutcome = String(outcome || "ATTEMPTED").toUpperCase();
     const validMethods = ["CALL", "WHATSAPP"];
-    const validOutcomes = ["ANSWERED", "NO_ANSWER", "PHONE_OFF", "INVALID_NUMBER", "CALLBACK_REQUESTED"];
+    const validOutcomes = ["ATTEMPTED", "ANSWERED", "NO_ANSWER", "PHONE_OFF", "INVALID_NUMBER", "CALLBACK_REQUESTED"];
 
     if (!packageId || !validMethods.includes(normalizedMethod) || !validOutcomes.includes(normalizedOutcome)) {
       return res.status(400).json({
@@ -2539,6 +2632,7 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         riderId: req.auth.riderId,
         method: normalizedMethod,
         outcome: normalizedOutcome,
+        attemptId: attemptId || null,
         notes: notes?.trim() || null,
         timestamp: nowStr,
         createdAt: nowStr
@@ -2612,7 +2706,6 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
       proofStatus,
       reason,
       riderNotes,
-      customerContacted,
       newDeliveryDate,
       idempotencyKey,
       digitalReference
@@ -2622,15 +2715,7 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
       return res.status(400).json({ success: false, error: { code: "INVALID_ARGUMENT", message: "Missing packageId or status" } });
     }
 
-    // 1. Strict Delivery Outcome Validation
-    const ALLOWED_OUTCOMES = [
-      "DELIVERED",
-      "CUSTOMER_UNAVAILABLE",
-      "RESCHEDULED",
-      "REFUSED",
-      "ADDRESS_ISSUE",
-      "CUSTOMER_CANCELLED"
-    ];
+    const ALLOWED_OUTCOMES = ["DELIVERED", "CUSTOMER_UNAVAILABLE", "RESCHEDULED", "REFUSED", "ADDRESS_ISSUE", "CUSTOMER_CANCELLED"];
     const rawOutcome = (status || "").toUpperCase().replace(/[\s-]+/g, "_");
     if (!ALLOWED_OUTCOMES.includes(rawOutcome)) {
       return res.status(400).json({
@@ -2639,7 +2724,6 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
       });
     }
 
-    // 2. Client-side Proof & Input Validations before starting transaction
     const hasLat = isValidCoordinate(latitude, -90, 90);
     const hasLng = isValidCoordinate(longitude, -180, 180);
     const legacyProofPayload = [proofImageUrl, proofPhoto, proofImage].find((value) => typeof value === "string" && value.trim()) as string | undefined;
@@ -2654,47 +2738,23 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
 
     if (rawOutcome === "DELIVERED") {
       if (collectedAmount === undefined || collectedAmount === null || collectedAmount === "" || isNaN(Number(collectedAmount))) {
-        return res.status(400).json({
-          success: false,
-          error: { code: "COLLECTED_AMOUNT_REQUIRED", message: "Delivered status requires actual collected amount." }
-        });
+        return res.status(400).json({ success: false, error: { code: "COLLECTED_AMOUNT_REQUIRED", message: "Delivered status requires actual collected amount." } });
       }
-      const collAmt = Number(collectedAmount);
-      if (collAmt < 0) {
-        return res.status(400).json({
-          success: false,
-          error: { code: "NEGATIVE_COD_REJECTED", message: "Collected amount cannot be negative." }
-        });
+      if (Number(collectedAmount) < 0) {
+        return res.status(400).json({ success: false, error: { code: "NEGATIVE_COD_REJECTED", message: "Collected amount cannot be negative." } });
       }
-
       if (!receiverName || typeof receiverName !== "string" || !receiverName.trim()) {
-        return res.status(400).json({
-          success: false,
-          error: { code: "RECEIVER_NAME_REQUIRED", message: "Delivered status requires receiverName." }
-        });
+        return res.status(400).json({ success: false, error: { code: "RECEIVER_NAME_REQUIRED", message: "Delivered status requires receiverName." } });
       }
-
-      // Photo proof requirement
       if (!storageProofPath) {
-        return res.status(400).json({
-          success: false,
-          error: { code: "PROOF_STORAGE_PATH_REQUIRED", message: "Delivered status requires a Firebase Storage proof path." }
-        });
+        return res.status(400).json({ success: false, error: { code: "PROOF_STORAGE_PATH_REQUIRED", message: "Delivered status requires a Firebase Storage proof path." } });
       }
     } else if (rawOutcome === "RESCHEDULED") {
       if (!newDeliveryDate || typeof newDeliveryDate !== "string" || !newDeliveryDate.trim()) {
-        return res.status(400).json({
-          success: false,
-          error: { code: "NEW_DELIVERY_DATE_REQUIRED", message: "Rescheduled status requires a new delivery date." }
-        });
+        return res.status(400).json({ success: false, error: { code: "NEW_DELIVERY_DATE_REQUIRED", message: "Rescheduled status requires a new delivery date." } });
       }
-    } else {
-      if (!reason || typeof reason !== "string" || !reason.trim()) {
-        return res.status(400).json({
-          success: false,
-          error: { code: "REASON_REQUIRED", message: "Failed delivery outcome requires a reason." }
-        });
-      }
+    } else if (!reason || typeof reason !== "string" || !reason.trim()) {
+      return res.status(400).json({ success: false, error: { code: "REASON_REQUIRED", message: "Failed delivery outcome requires a reason." } });
     }
 
     const effectiveAttemptId = customAttemptId || deliveryAttemptId || `att_${crypto.randomUUID()}`;
@@ -2702,8 +2762,15 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
     const nowStr = new Date().toISOString();
 
     try {
+      if (rawOutcome === "DELIVERED") {
+        await verifyDeliveryProofStorageObject({
+          uid: req.auth.uid,
+          attemptId: effectiveAttemptId,
+          proofStoragePath: storageProofPath
+        });
+      }
+
       const result = await db.runTransaction(async (t: any) => {
-        // Read 1: Package Doc
         const pkgRef = db.collection("packages").doc(packageId);
         const pkgDoc = await t.get(pkgRef);
         if (!pkgDoc.exists) {
@@ -2712,15 +2779,10 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
 
         const pkgData = pkgDoc.data();
         const assignedRiderId = pkgData?.assignedRiderId;
-
-        // Rider Ownership Check
-        if (req.auth.role === "rider") {
-          if (assignedRiderId !== req.auth.riderId) {
-            throw { status: 403, code: "FORBIDDEN", message: "You are not assigned to this package. Rider completing unassigned package is strictly rejected." };
-          }
+        if (req.auth.role === "rider" && assignedRiderId !== req.auth.riderId) {
+          throw { status: 403, code: "FORBIDDEN", message: "You are not assigned to this package. Rider completing unassigned package is strictly rejected." };
         }
 
-        // Read 2: Idempotency Doc
         const idemRef = db.collection("idempotencyKeys").doc(effectiveIdemKey);
         const idemDoc = await t.get(idemRef);
         if (idemDoc.exists) {
@@ -2728,35 +2790,45 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
           return { idempotent: true, data: stored?.attemptRecord || { packageId, status: rawOutcome } };
         }
 
-        // State Check: ONLY OUT_FOR_DELIVERY is permitted
         const currOpStatus = (pkgData?.operationalStatus || pkgData?.current_status || "").toUpperCase().replace(/[\s-]+/g, "_");
         if (currOpStatus !== "OUT_FOR_DELIVERY") {
           if (currOpStatus === "DELIVERED") {
-            // Already delivered
             throw { status: 400, code: "DUPLICATE_DELIVERY_SUBMISSION", message: "Package is already delivered. Duplicate delivery submission rejected." };
           }
           throw { status: 400, code: "INVALID_STATE_TRANSITION", message: `Cannot record delivery attempt for package in state "${currOpStatus}". Package must be OUT_FOR_DELIVERY.` };
         }
 
-        const gpsExceptionApproved = Boolean(pkgData?.gpsExceptionApproved);
-        if (rawOutcome === "DELIVERED" && (!hasLat || !hasLng) && !gpsExceptionApproved) {
-          throw { status: 400, code: "GPS_COORDINATES_REQUIRED", message: "Delivered status requires valid GPS coordinates unless a privileged GPS exception has already been approved." };
+        let gpsExceptionRecord: any = null;
+        if (rawOutcome === "DELIVERED" && (!hasLat || !hasLng)) {
+          const gpsExceptionId = String(pkgData?.gpsExceptionId || "").trim();
+          if (!gpsExceptionId) {
+            throw { status: 400, code: "GPS_COORDINATES_REQUIRED", message: "Delivered status requires valid GPS coordinates unless a privileged GPS exception has already been approved." };
+          }
+          const gpsRef = db.collection("deliveryGpsExceptions").doc(gpsExceptionId);
+          const gpsDoc = await t.get(gpsRef);
+          if (!gpsDoc.exists) throw { status: 400, code: "GPS_EXCEPTION_NOT_FOUND", message: "Approved GPS exception record was not found." };
+          gpsExceptionRecord = gpsDoc.data();
+          const normalizedGpsStatus = String(gpsExceptionRecord?.status || "").toLowerCase();
+          const expiresAt = normalizeIsoDate(gpsExceptionRecord?.expiresAt);
+          if (normalizedGpsStatus !== "approved") throw { status: 400, code: "GPS_EXCEPTION_INVALID", message: "GPS exception is not currently approved." };
+          if (String(gpsExceptionRecord?.packageId || "") !== packageId) throw { status: 400, code: "GPS_EXCEPTION_PACKAGE_MISMATCH", message: "GPS exception does not belong to this package." };
+          if (expiresAt && Date.parse(nowStr) > Date.parse(expiresAt)) throw { status: 400, code: "GPS_EXCEPTION_EXPIRED", message: "GPS exception has expired and cannot be used." };
+          if (gpsExceptionRecord?.consumedAt || gpsExceptionRecord?.consumedAttemptId) {
+            throw { status: 409, code: "GPS_EXCEPTION_ALREADY_CONSUMED", message: "GPS exception has already been consumed by another attempt." };
+          }
         }
 
-        // Determine Payment & COD amounts
-        const isPrepaid = (pkgData.paymentMethod || pkgData.payment_method || "").toLowerCase() === "prepaid" ||
-                          Number(pkgData.expectedCod || pkgData.cod_expected || 0) === 0;
+        const isPrepaid = (pkgData.paymentMethod || pkgData.payment_method || "").toLowerCase() === "prepaid" || Number(pkgData.expectedCod || pkgData.cod_expected || 0) === 0;
         const expectedCod = isPrepaid ? 0 : Number(pkgData.cod_expected || pkgData.expectedCod || pkgData.codExpected || 0);
         const collAmt = rawOutcome === "DELIVERED" ? (isPrepaid ? 0 : Number(collectedAmount)) : 0;
         const normPayment = (paymentMethod || pkgData.paymentMethod || pkgData.payment_method || (isPrepaid ? "prepaid" : "cash")).toLowerCase().replace(/[\s_]+/g, "_");
         const isDigital = ["jazzcash", "easypaisa", "bank_transfer"].includes(normPayment);
 
-        if (rawOutcome === "DELIVERED" && isDigital && (!digitalReference || !digitalReference.trim())) {
-          throw { status: 400, code: "DIGITAL_REFERENCE_REQUIRED", message: "Digital payment method requires a digital reference." };
-        }
-
         let normalizedDigitalReference: string | null = null;
         if (rawOutcome === "DELIVERED" && isDigital) {
+          if (!digitalReference || !digitalReference.trim()) {
+            throw { status: 400, code: "DIGITAL_REFERENCE_REQUIRED", message: "Digital payment method requires a digital reference." };
+          }
           normalizedDigitalReference = normalizeDigitalReference(digitalReference);
           if (!normalizedDigitalReference) {
             throw { status: 400, code: "DIGITAL_REFERENCE_REQUIRED", message: "Digital payment reference cannot be blank." };
@@ -2776,9 +2848,7 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
           .where("riderId", "==", (req.auth.riderId || assignedRiderId))
           .limit(1);
         const contactEventsSnap = await t.get(contactEventsQuery);
-        const isContacted = !contactEventsSnap.empty;
 
-        // Build Attempt Record
         const attemptRef = db.collection("deliveryAttempts").doc(effectiveAttemptId);
         const attemptRecord = {
           id: effectiveAttemptId,
@@ -2795,7 +2865,7 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
           proofStoragePath: storageProofPath || null,
           reason: reason || null,
           riderNotes: riderNotes || null,
-          customerContacted: isContacted,
+          customerContacted: !contactEventsSnap.empty,
           newDeliveryDate: rawOutcome === "RESCHEDULED" ? newDeliveryDate.trim() : null,
           serverTimestamp: nowStr,
           deviceTimestamp: deviceTimestamp || nowStr,
@@ -2804,14 +2874,14 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
           idempotencyKey: effectiveIdemKey,
           createdAt: nowStr
         };
-
         t.set(attemptRef, attemptRecord);
 
         let codCollectionRecord = null;
-        let txId = null;
+        let txId: string | null = null;
+        let codCollectionId: string | null = null;
+        let collectionDiscrepancyId: string | null = null;
 
         if (rawOutcome === "DELIVERED") {
-          // Update Package to DELIVERED
           t.update(pkgRef, {
             current_status: "Delivered",
             operationalStatus: "delivered",
@@ -2822,70 +2892,67 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
             updatedAt: nowStr
           });
 
-          // If COD and amount > 0, post COD Collection and Financial Ledger Transaction
-          if (!isPrepaid && collAmt > 0) {
-            const codId = `cod_${crypto.randomUUID()}`;
-            txId = `tx_${crypto.randomUUID()}`;
+          if (!isPrepaid) {
+            codCollectionId = `cod_${crypto.randomUUID()}`;
             const collectionVariance = collAmt - expectedCod;
-
             let accountCode = "RIDER_CASH_WALLET";
             if (normPayment === "jazzcash") accountCode = "JAZZCASH_CLEARING";
             else if (normPayment === "easypaisa") accountCode = "EASYPAISA_CLEARING";
             else if (normPayment === "bank_transfer") accountCode = "BANK_TRANSFER_CLEARING";
 
-            // 1. Financial Transaction
-            const txRef = db.collection("financialTransactions").doc(txId);
-            t.set(txRef, {
-              id: txId,
-              transactionType: "COD_COLLECTION",
-              sourceType: "cod_collection",
-              sourceId: packageId,
-              packageId,
-              riderId: req.auth.riderId || assignedRiderId,
-              cashierProfileId: null,
-              settlementId: null,
-              bankDepositId: null,
-              status: "posted",
-              currency: "PKR",
-              totalDebit: collAmt,
-              totalCredit: collAmt,
-              idempotencyKey: effectiveIdemKey,
-              createdByUid: req.auth.uid,
-              createdAt: nowStr,
-              reversedTransactionId: null,
-              reversedByUid: null,
-              reversedAt: null,
-              reversalReason: null
-            });
+            if (collAmt > 0) {
+              txId = `tx_${crypto.randomUUID()}`;
+              const txRef = db.collection("financialTransactions").doc(txId);
+              t.set(txRef, {
+                id: txId,
+                transactionType: "COD_COLLECTION",
+                sourceType: "cod_collection",
+                sourceId: packageId,
+                packageId,
+                riderId: req.auth.riderId || assignedRiderId,
+                cashierProfileId: null,
+                settlementId: null,
+                bankDepositId: null,
+                status: "posted",
+                currency: "PKR",
+                totalDebit: collAmt,
+                totalCredit: collAmt,
+                idempotencyKey: effectiveIdemKey,
+                createdByUid: req.auth.uid,
+                createdAt: nowStr,
+                reversedTransactionId: null,
+                reversedByUid: null,
+                reversedAt: null,
+                reversalReason: null
+              });
 
-            // 2. Financial Postings (Debit Rider Wallet / Credit Customer COD Receivable)
-            const postDebitRef = db.collection("financialPostings").doc(`post_dr_${crypto.randomUUID()}`);
-            t.set(postDebitRef, {
-              id: postDebitRef.id,
-              transactionId: txId,
-              accountCode,
-              debitAmount: collAmt,
-              creditAmount: 0,
-              packageId,
-              riderId: req.auth.riderId || assignedRiderId,
-              createdAt: nowStr
-            });
+              const postDebitRef = db.collection("financialPostings").doc(`post_dr_${crypto.randomUUID()}`);
+              t.set(postDebitRef, {
+                id: postDebitRef.id,
+                transactionId: txId,
+                accountCode,
+                debitAmount: collAmt,
+                creditAmount: 0,
+                packageId,
+                riderId: req.auth.riderId || assignedRiderId,
+                createdAt: nowStr
+              });
 
-            const postCreditRef = db.collection("financialPostings").doc(`post_cr_${crypto.randomUUID()}`);
-            t.set(postCreditRef, {
-              id: postCreditRef.id,
-              transactionId: txId,
-              accountCode: "CUSTOMER_COD_RECEIVABLE",
-              debitAmount: 0,
-              creditAmount: collAmt,
-              packageId,
-              riderId: req.auth.riderId || assignedRiderId,
-              createdAt: nowStr
-            });
+              const postCreditRef = db.collection("financialPostings").doc(`post_cr_${crypto.randomUUID()}`);
+              t.set(postCreditRef, {
+                id: postCreditRef.id,
+                transactionId: txId,
+                accountCode: "CUSTOMER_COD_RECEIVABLE",
+                debitAmount: 0,
+                creditAmount: collAmt,
+                packageId,
+                riderId: req.auth.riderId || assignedRiderId,
+                createdAt: nowStr
+              });
+            }
 
-            // 3. COD Collection record
             codCollectionRecord = {
-              id: codId,
+              id: codCollectionId,
               packageId,
               riderId: req.auth.riderId || assignedRiderId,
               expectedCod,
@@ -2895,21 +2962,47 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
               collectionVariance,
               idempotencyKey: effectiveIdemKey,
               transactionId: txId,
-              createdAt: nowStr
+              discrepancyId: null,
+              createdAt: nowStr,
+              updatedAt: nowStr
             };
-            const codRef = db.collection("codCollections").doc(codId);
-            t.set(codRef, codCollectionRecord);
 
-            if (isDigital) {
-              const digRef = db.collection("digitalPaymentVerifications").doc(`dig_${normalizedDigitalReference}`);
-              t.set(digRef, {
+            if (collectionVariance !== 0) {
+              collectionDiscrepancyId = `cod_disc_${crypto.randomUUID()}`;
+              codCollectionRecord.discrepancyId = collectionDiscrepancyId;
+              t.set(db.collection("codCollectionDiscrepancies").doc(collectionDiscrepancyId), {
+                id: collectionDiscrepancyId,
+                packageId,
+                riderId: req.auth.riderId || assignedRiderId,
+                expectedCod,
+                collectedAmount: collAmt,
+                variance: collectionVariance,
+                reason: null,
+                resolutionType: null,
+                status: "OPEN",
+                createdAt: nowStr,
+                approvedAt: null,
+                approvedByUid: null,
+                resolvedAt: null,
+                resolvedByUid: null,
+                settlementId: null
+              });
+            }
+
+            t.set(db.collection("codCollections").doc(codCollectionId), codCollectionRecord);
+
+            if (isDigital && normalizedDigitalReference) {
+              t.set(db.collection("digitalPaymentVerifications").doc(`dig_${normalizedDigitalReference}`), {
                 id: `dig_${normalizedDigitalReference}`,
                 digitalReference: normalizedDigitalReference,
                 packageId,
                 paymentMethod: normPayment,
                 amount: collAmt,
+                verificationStatus: "PENDING",
                 status: "pending",
+                verificationNote: null,
                 verifiedByUid: null,
+                verifiedAt: null,
                 createdAt: nowStr
               });
             }
@@ -2930,10 +3023,8 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
             createdAt: nowStr
           });
 
-          // 4. Audit Event
-          const auditRef = db.collection("auditLogs").doc(`audit_${crypto.randomUUID()}`);
-          t.set(auditRef, {
-            id: auditRef.id,
+          t.set(db.collection("auditLogs").doc(`audit_${crypto.randomUUID()}`), {
+            id: `audit_${crypto.randomUUID()}`,
             action: "PACKAGE_DELIVERED",
             packageId,
             riderId: req.auth.riderId || assignedRiderId,
@@ -2943,12 +3034,30 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
               attemptId: effectiveAttemptId,
               collectedAmount: collAmt,
               paymentMethod: normPayment,
-              txId
+              txId,
+              collectionDiscrepancyId
             },
             timestamp: nowStr
           });
+
+          if (gpsExceptionRecord) {
+            t.set(db.collection("deliveryGpsExceptions").doc(String(gpsExceptionRecord.id)), {
+              status: "consumed",
+              consumedAttemptId: effectiveAttemptId,
+              consumedAt: nowStr,
+              consumedByUid: req.auth.uid,
+              updatedAt: nowStr
+            }, { merge: true });
+            t.set(pkgRef, {
+              gpsExceptionApproved: false,
+              gpsExceptionId: null,
+              gpsExceptionApprovedAt: null,
+              gpsExceptionApprovedByUid: null,
+              gpsExceptionReason: null,
+              gpsExceptionExpiresAt: null
+            }, { merge: true });
+          }
         } else {
-          // Failed delivery outcome
           let targetStatus = "Customer Unavailable";
           let targetOpStatus = "customer_unavailable";
           if (rawOutcome === "RESCHEDULED") { targetStatus = "Rescheduled"; targetOpStatus = "rescheduled"; }
@@ -2964,9 +3073,7 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
             updatedAt: nowStr
           });
 
-          // Return Initiation Record
-          const returnRef = db.collection("returns").doc(`ret_${packageId}`);
-          t.set(returnRef, {
+          t.set(db.collection("returns").doc(`ret_${packageId}`), {
             id: `ret_${packageId}`,
             packageId,
             packageNumber: pkgData?.packageNumber || pkgData?.package_number || packageId,
@@ -2977,10 +3084,8 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
             updatedAt: nowStr
           }, { merge: true });
 
-          // Audit Event
-          const auditRef = db.collection("auditLogs").doc(`audit_${crypto.randomUUID()}`);
-          t.set(auditRef, {
-            id: auditRef.id,
+          t.set(db.collection("auditLogs").doc(`audit_${crypto.randomUUID()}`), {
+            id: `audit_${crypto.randomUUID()}`,
             action: `DELIVERY_FAILED_${rawOutcome}`,
             packageId,
             riderId: req.auth.riderId || assignedRiderId,
@@ -2991,7 +3096,6 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
           });
         }
 
-        // Set Idempotency Key
         t.set(idemRef, {
           key: effectiveIdemKey,
           packageId,
@@ -3152,22 +3256,40 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
           .filter((c: any) => !c.settlementId && !c.assignedSettlementId);
 
         const calculatedCashObligation = eligibleCollections.reduce((sum: number, c: any) => sum + Number(c.collectedAmount || 0), 0);
+        const collectionVariance = eligibleCollections.reduce((sum: number, c: any) => sum + Number(c.collectionVariance || 0), 0);
         const riderHandoverVariance = Number(declaredCashAmount) - calculatedCashObligation;
+        let unresolvedCollectionDiscrepancyCount = 0;
+        for (const col of eligibleCollections) {
+          if (col.discrepancyId) {
+            const discrepancyDoc = await transaction.get(db.collection("codCollectionDiscrepancies").doc(col.discrepancyId));
+            const discrepancyData = discrepancyDoc.exists ? discrepancyDoc.data() : null;
+            if (String(discrepancyData?.status || "").toUpperCase() === "OPEN") {
+              unresolvedCollectionDiscrepancyCount += 1;
+            }
+          }
+        }
+        const settlementState = buildCollectionDiscrepancyStatus({
+          collectionVariance,
+          riderHandoverVariance,
+          cashierVariance: 0,
+          unresolvedCollectionDiscrepancyCount
+        });
         const nowStr = new Date().toISOString();
         const settlementDoc = {
           id: targetSettlementId,
           settlementNumber: `SET-${Date.now().toString().slice(-6)}`,
           riderId,
-          status: "rider_submitted",
+          status: settlementState.requiresResolution ? "discrepancy" : "rider_submitted",
           calculatedCashObligation,
           declaredCashAmount: Number(declaredCashAmount),
           physicallyReceivedAmount: 0,
-          collectionVariance: eligibleCollections.reduce((sum: number, c: any) => sum + Number(c.collectionVariance || 0), 0),
+          collectionVariance,
           riderHandoverVariance,
           cashierVariance: 0,
-          totalSettlementVariance: 0,
-          discrepancyType: "NONE",
-          discrepancyAmount: 0,
+          totalSettlementVariance: settlementState.totalSettlementVariance,
+          unresolvedCollectionDiscrepancyCount,
+          discrepancyType: settlementState.discrepancyType,
+          discrepancyAmount: settlementState.totalSettlementVariance,
           discrepancyReason: null,
           notes: notes || null,
           receiptNotes: null,
@@ -3191,6 +3313,9 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
             riderId,
             packageId: col.packageId,
             collectedAmount: col.collectedAmount,
+            expectedCod: col.expectedCod || 0,
+            collectionVariance: Number(col.collectionVariance || 0),
+            discrepancyId: col.discrepancyId || null,
             paymentMethod: "cash",
             createdAt: nowStr
           });
@@ -3200,6 +3325,12 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
             settlementAssignedAt: nowStr,
             updatedAt: nowStr
           });
+          if (col.discrepancyId) {
+            transaction.set(db.collection("codCollectionDiscrepancies").doc(col.discrepancyId), {
+              settlementId: targetSettlementId,
+              updatedAt: nowStr
+            }, { merge: true });
+          }
         });
 
         responseData = settlementDoc;
@@ -3224,76 +3355,136 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
       if (!settlementId || physicallyReceivedAmount === undefined || physicallyReceivedAmount < 0) {
         return res.status(400).json({ success: false, error: { code: "INVALID_ARGUMENT", message: "Missing settlementId or valid physicallyReceivedAmount" } });
       }
-
       const stlRef = db.collection("riderSettlements").doc(settlementId);
-      const stlDoc = await stlRef.get();
-      if (!stlDoc.exists) {
-        return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: `Settlement ${settlementId} not found` } });
-      }
+      const idemKey = (idempotencyKey || `idem_rcv_${settlementId}_${Date.now()}`).trim();
+      const idemRef = db.collection("idempotencyKeys").doc(idemKey);
+      let updatedDoc: any = null;
 
-      const stlData = stlDoc.data();
-      if (stlData?.status !== "rider_submitted") {
-        return res.status(400).json({ success: false, error: { code: "INVALID_SETTLEMENT_STAGE", message: `Cannot receive physical cash for settlement in stage "${stlData?.status}". Stage skipping rejected.` } });
-      }
+      await db.runTransaction(async (transaction: any) => {
+        const existingIdem = await transaction.get(idemRef);
+        if (existingIdem.exists) {
+          updatedDoc = existingIdem.data()?.result || null;
+          return;
+        }
 
-      if (stlData.riderId === req.auth.riderId || stlData.riderId === req.auth.uid) {
-        return res.status(403).json({ success: false, error: { code: "SELF_ACTION_REJECTED", message: "Rider cannot confirm their own cashier receipt." } });
-      }
+        const stlDoc = await transaction.get(stlRef);
+        if (!stlDoc.exists) {
+          throw { status: 404, code: "NOT_FOUND", message: `Settlement ${settlementId} not found` };
+        }
+        const stlData = stlDoc.data();
+        if (stlData.riderId === req.auth.riderId || stlData.riderId === req.auth.uid) {
+          throw { status: 403, code: "SELF_ACTION_REJECTED", message: "Rider cannot confirm their own cashier receipt." };
+        }
+        if (stlData?.receiptTransactionId || stlData?.status === "cashier_received" || stlData?.status === "manager_approved" || stlData?.status === "closed") {
+          throw { status: 409, code: "SETTLEMENT_ALREADY_RECEIVED", message: "Physical cashier receipt has already been recorded for this settlement." };
+        }
+        if (!["rider_submitted", "discrepancy"].includes(String(stlData?.status || ""))) {
+          throw { status: 400, code: "INVALID_SETTLEMENT_STAGE", message: `Cannot receive physical cash for settlement in stage "${stlData?.status}". Stage skipping rejected.` };
+        }
 
-      const receivedAmt = Number(physicallyReceivedAmount);
-      const calculatedCash = Number(stlData.calculatedCashObligation || 0);
-      const declaredAmt = Number(stlData.declaredCashAmount || 0);
-      const cashierVariance = receivedAmt - declaredAmt;
-      const totalSettlementVariance = receivedAmt - calculatedCash;
-      const hasDiscrepancy = cashierVariance !== 0 || totalSettlementVariance !== 0;
-      const discrepancyType = totalSettlementVariance < 0 ? "SHORT" : (totalSettlementVariance > 0 ? "EXCESS" : (cashierVariance !== 0 ? "DECLARATION_MISMATCH" : "NONE"));
+        const receivedAmt = Number(physicallyReceivedAmount);
+        const declaredAmt = Number(stlData.declaredCashAmount || 0);
+        const cashierVariance = receivedAmt - declaredAmt;
+        const settlementState = buildCollectionDiscrepancyStatus({
+          collectionVariance: Number(stlData.collectionVariance || 0),
+          riderHandoverVariance: Number(stlData.riderHandoverVariance || 0),
+          cashierVariance,
+          unresolvedCollectionDiscrepancyCount: Number(stlData.unresolvedCollectionDiscrepancyCount || 0)
+        });
+        const nowStr = new Date().toISOString();
+        const receiptTransactionId = `tx_${crypto.randomUUID()}`;
 
-      const nowStr = new Date().toISOString();
-      const idemKey = idempotencyKey || `idem_rcv_${settlementId}_${Date.now()}`;
-
-      const txRes = await createDoubleEntryTransaction(db, {
-        transactionType: "RIDER_SETTLEMENT_RECEIPT",
-        sourceType: "rider_settlement",
-        sourceId: settlementId,
-        settlementId,
-        riderId: stlData.riderId,
-        cashierProfileId: req.auth.uid,
-        idempotencyKey: idemKey,
-        createdByUid: req.auth.uid,
-        postings: [
-          { accountCode: "CASHIER_CASH_CONTROL", debitAmount: receivedAmt, creditAmount: 0 },
-          { accountCode: "RIDER_CASH_WALLET", debitAmount: 0, creditAmount: receivedAmt }
-        ]
-      });
-
-      const nextStatus = hasDiscrepancy ? "discrepancy" : "cashier_received";
-
-      await stlRef.update({
-        physicallyReceivedAmount: receivedAmt,
-        cashierVariance,
-        totalSettlementVariance,
-        discrepancyAmount: totalSettlementVariance !== 0 ? totalSettlementVariance : cashierVariance,
-        discrepancyType,
-        status: nextStatus,
-        receiptNotes: receiptNotes || null,
-        receivedAt: nowStr,
-        updatedAt: nowStr
-      });
-
-      if (hasDiscrepancy) {
-        const auditRef = db.collection("financialAuditEvents").doc();
-        await auditRef.set({
-          id: auditRef.id,
-          eventType: "SETTLEMENT_DISCREPANCY_DETECTED",
-          entityType: "rider_settlement",
-          entityId: settlementId,
-          actorUid: req.auth.uid,
-          details: { cashierVariance, declared: stlData.declaredCashAmount, received: receivedAmt },
+        transaction.set(db.collection("financialTransactions").doc(receiptTransactionId), {
+          id: receiptTransactionId,
+          transactionType: "RIDER_SETTLEMENT_RECEIPT",
+          sourceType: "rider_settlement",
+          sourceId: settlementId,
+          packageId: null,
+          riderId: stlData.riderId,
+          cashierProfileId: req.auth.uid,
+          settlementId,
+          bankDepositId: null,
+          status: "posted",
+          currency: "PKR",
+          totalDebit: receivedAmt,
+          totalCredit: receivedAmt,
+          idempotencyKey: idemKey,
+          createdByUid: req.auth.uid,
+          createdAt: nowStr,
+          reversedTransactionId: null,
+          reversedByUid: null,
+          reversedAt: null,
+          reversalReason: null
+        });
+        const debitRef = db.collection("financialPostings").doc();
+        transaction.set(debitRef, {
+          id: debitRef.id,
+          transactionId: receiptTransactionId,
+          accountCode: "CASHIER_CASH_CONTROL",
+          debitAmount: receivedAmt,
+          creditAmount: 0,
+          packageId: null,
+          riderId: stlData.riderId,
+          settlementId,
+          bankDepositId: null,
           createdAt: nowStr
         });
-      }
+        const creditRef = db.collection("financialPostings").doc();
+        transaction.set(creditRef, {
+          id: creditRef.id,
+          transactionId: receiptTransactionId,
+          accountCode: "RIDER_CASH_WALLET",
+          debitAmount: 0,
+          creditAmount: receivedAmt,
+          packageId: null,
+          riderId: stlData.riderId,
+          settlementId,
+          bankDepositId: null,
+          createdAt: nowStr
+        });
 
-      const updatedDoc = (await stlRef.get()).data();
+        updatedDoc = {
+          ...stlData,
+          physicallyReceivedAmount: receivedAmt,
+          cashierVariance,
+          totalSettlementVariance: settlementState.totalSettlementVariance,
+          discrepancyAmount: settlementState.totalSettlementVariance,
+          discrepancyType: settlementState.discrepancyType,
+          status: settlementState.requiresResolution ? "discrepancy" : "cashier_received",
+          receiptNotes: receiptNotes || null,
+          receivedAt: nowStr,
+          receiptTransactionId,
+          receiptIdempotencyKey: idemKey,
+          updatedAt: nowStr
+        };
+        transaction.set(stlRef, updatedDoc, { merge: true });
+
+        if (settlementState.requiresResolution) {
+          const auditRef = db.collection("financialAuditEvents").doc();
+          transaction.set(auditRef, {
+            id: auditRef.id,
+            eventType: "SETTLEMENT_DISCREPANCY_DETECTED",
+            entityType: "rider_settlement",
+            entityId: settlementId,
+            actorUid: req.auth.uid,
+            details: {
+              collectionVariance: Number(stlData.collectionVariance || 0),
+              riderHandoverVariance: Number(stlData.riderHandoverVariance || 0),
+              cashierVariance,
+              received: receivedAmt
+            },
+            createdAt: nowStr
+          });
+        }
+
+        transaction.set(idemRef, {
+          key: idemKey,
+          action: "SETTLEMENT_CASHIER_RECEIPT",
+          result: updatedDoc,
+          createdAt: nowStr
+        });
+      });
+
       return res.json({ success: true, data: updatedDoc });
     } catch (err: any) {
       const status = err.status || 400;
@@ -3309,26 +3500,13 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         return res.status(400).json({ success: false, error: { code: "RESOLUTION_TYPE_REQUIRED", message: "A privileged discrepancy resolution type is required." } });
       }
       const normalizedResolutionType = String(resolutionType).trim().toUpperCase();
+      const normalizedReason = String(discrepancyReason || "").trim().toUpperCase();
+      if (normalizedReason && !COLLECTION_DISCREPANCY_REASONS.includes(normalizedReason as any)) {
+        return res.status(400).json({ success: false, error: { code: "INVALID_COLLECTION_DISCREPANCY_REASON", message: `Unsupported discrepancy reason "${discrepancyReason}".` } });
+      }
       const stlRef = db.collection("riderSettlements").doc(settlementId);
       const idemKey = (idempotencyKey || `settlement_resolution_${settlementId}_${normalizedResolutionType}`).trim();
       const idemRef = db.collection("idempotencyKeys").doc(idemKey);
-
-      const resolutionResult = await createDoubleEntryTransaction(db, {
-        transactionType: "SETTLEMENT_DISCREPANCY_RESOLUTION",
-        sourceType: "rider_settlement",
-        sourceId: settlementId,
-        settlementId,
-        idempotencyKey: `ledger_${idemKey}`,
-        createdByUid: req.auth.uid,
-        postings: await (async () => {
-          const stlDoc = await stlRef.get();
-          if (!stlDoc.exists) {
-            throw { status: 404, code: "NOT_FOUND", message: `Settlement ${settlementId} not found` };
-          }
-          return buildSettlementResolutionPostings(stlDoc.data(), normalizedResolutionType);
-        })()
-      });
-
       let updatedDoc: any;
       await db.runTransaction(async (transaction: any) => {
         const existingIdem = await transaction.get(idemRef);
@@ -3358,6 +3536,63 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         if (!effectiveReason) {
           throw { status: 400, code: "RESOLUTION_REASON_REQUIRED", message: "Resolution requires an explicit reason." };
         }
+        const openDiscrepancyLines = (await transaction.get(db.collection("settlementLines").where("settlementId", "==", settlementId))).docs
+          .map((doc: any) => doc.data())
+          .filter((line: any) => line.discrepancyId);
+        const openCollectionDiscrepancyIds: string[] = [];
+        for (const line of openDiscrepancyLines) {
+          const discrepancyDoc = await transaction.get(db.collection("codCollectionDiscrepancies").doc(String(line.discrepancyId)));
+          const discrepancyData = discrepancyDoc.exists ? discrepancyDoc.data() : null;
+          if (String(discrepancyData?.status || "").toUpperCase() === "OPEN") {
+            openCollectionDiscrepancyIds.push(String(line.discrepancyId));
+          }
+        }
+        if (Number(stlData.totalSettlementVariance || 0) === 0 && openCollectionDiscrepancyIds.length === 0) {
+          throw { status: 400, code: "NO_OPEN_DISCREPANCY", message: "Settlement has no open discrepancy to resolve." };
+        }
+        if (stlData?.resolutionTransactionId || stlData?.status === "manager_approved") {
+          throw { status: 409, code: "DISCREPANCY_ALREADY_RESOLVED", message: "A discrepancy resolution has already been posted for this settlement." };
+        }
+
+        const postings = buildSettlementResolutionPostings(stlData, normalizedResolutionType);
+        const resolutionTransactionId = `tx_${crypto.randomUUID()}`;
+        transaction.set(db.collection("financialTransactions").doc(resolutionTransactionId), {
+          id: resolutionTransactionId,
+          transactionType: "SETTLEMENT_DISCREPANCY_RESOLUTION",
+          sourceType: "rider_settlement",
+          sourceId: settlementId,
+          packageId: null,
+          riderId: stlData.riderId || null,
+          cashierProfileId: null,
+          settlementId,
+          bankDepositId: null,
+          status: "posted",
+          currency: "PKR",
+          totalDebit: postings.reduce((sum: number, posting: any) => sum + Number(posting.debitAmount || 0), 0),
+          totalCredit: postings.reduce((sum: number, posting: any) => sum + Number(posting.creditAmount || 0), 0),
+          idempotencyKey: `ledger_${idemKey}`,
+          createdByUid: req.auth.uid,
+          createdAt: nowStr,
+          reversedTransactionId: null,
+          reversedByUid: null,
+          reversedAt: null,
+          reversalReason: null
+        });
+        for (const posting of postings) {
+          const postRef = db.collection("financialPostings").doc();
+          transaction.set(postRef, {
+            id: postRef.id,
+            transactionId: resolutionTransactionId,
+            accountCode: posting.accountCode,
+            debitAmount: posting.debitAmount,
+            creditAmount: posting.creditAmount,
+            packageId: null,
+            riderId: stlData.riderId || null,
+            settlementId,
+            bankDepositId: null,
+            createdAt: nowStr
+          });
+        }
 
         const nextDoc = {
           ...stlData,
@@ -3369,11 +3604,24 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
           resolutionApprovedAt: nowStr,
           approvedByUid: req.auth.uid,
           approvedAt: nowStr,
-          resolutionTransactionId: resolutionResult.transactionId,
+          resolutionTransactionId,
+          unresolvedCollectionDiscrepancyCount: 0,
           updatedAt: nowStr
         };
 
         transaction.set(stlRef, nextDoc, { merge: true });
+        for (const discrepancyId of openCollectionDiscrepancyIds) {
+          transaction.set(db.collection("codCollectionDiscrepancies").doc(discrepancyId), {
+            status: "APPROVED",
+            reason: normalizedReason || null,
+            resolutionType: normalizedResolutionType,
+            resolutionReason: effectiveReason,
+            approvedAt: nowStr,
+            approvedByUid: req.auth.uid,
+            settlementId,
+            updatedAt: nowStr
+          }, { merge: true });
+        }
 
         const auditRef = db.collection("financialAuditEvents").doc();
         transaction.set(auditRef, {
@@ -3386,7 +3634,7 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
             discrepancyReason: nextDoc.discrepancyReason,
             resolutionType: normalizedResolutionType,
             resolutionReason: effectiveReason,
-            resolutionTransactionId: resolutionResult.transactionId
+            resolutionTransactionId
           },
           createdAt: nowStr
         });
@@ -3428,6 +3676,9 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
       if (stlData?.status !== "manager_approved" && stlData?.status !== "cashier_received") {
         return res.status(400).json({ success: false, error: { code: "UNAPPROVED_DISCREPANCY", message: "Settlement with unapproved discrepancy cannot be closed." } });
       }
+      if (Number(stlData?.unresolvedCollectionDiscrepancyCount || 0) > 0) {
+        return res.status(400).json({ success: false, error: { code: "UNRESOLVED_COLLECTION_DISCREPANCY", message: "Settlement with unresolved collection variance cannot be closed." } });
+      }
 
       const nowStr = new Date().toISOString();
       await stlRef.update({
@@ -3435,6 +3686,19 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         closedAt: nowStr,
         updatedAt: nowStr
       });
+      const lineSnap = await db.collection("settlementLines").where("settlementId", "==", settlementId).get();
+      for (const doc of lineSnap.docs) {
+        const line = doc.data();
+        if (line?.discrepancyId) {
+          await db.collection("codCollectionDiscrepancies").doc(String(line.discrepancyId)).set({
+            status: "RESOLVED",
+            resolvedAt: nowStr,
+            resolvedByUid: req.auth.uid,
+            settlementId,
+            updatedAt: nowStr
+          }, { merge: true });
+        }
+      }
 
       const updatedDoc = (await stlRef.get()).data();
       return res.json({ success: true, data: updatedDoc });
@@ -3465,6 +3729,56 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
       return res.json({ success: true, data: list });
     } catch (err: any) {
       return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: err.message } });
+    }
+  });
+
+  app.get("/api/finance/digital-payments", requireAuth, requireAnyRole("super_admin", "dispatch_manager", "cashier", "management_viewer"), async (_req: any, res: any) => {
+    try {
+      const snap = await db.collection("digitalPaymentVerifications").get();
+      return res.json({ success: true, data: snap.docs.map((doc: any) => doc.data()) });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: err.message } });
+    }
+  });
+
+  app.post("/api/finance/digital-payments/verify", requireAuth, requireAnyRole("super_admin", "cashier", "dispatch_manager"), async (req: any, res: any) => {
+    try {
+      const { digitalReference, packageId, amount, paymentChannel, verificationStatus, verificationNote } = req.body || {};
+      const normalizedReference = normalizeDigitalReference(digitalReference);
+      const normalizedStatus = String(verificationStatus || "").trim().toUpperCase();
+      if (!normalizedReference || !packageId || !paymentChannel || !DIGITAL_PAYMENT_STATUSES.includes(normalizedStatus as any)) {
+        return res.status(400).json({ success: false, error: { code: "INVALID_ARGUMENT", message: "digitalReference, packageId, paymentChannel, and a valid verificationStatus are required." } });
+      }
+      if ((normalizedStatus === "MISMATCH" || normalizedStatus === "REJECTED") && !String(verificationNote || "").trim()) {
+        return res.status(400).json({ success: false, error: { code: "VERIFICATION_NOTE_REQUIRED", message: "Mismatch or rejection requires a verification note." } });
+      }
+
+      const ref = db.collection("digitalPaymentVerifications").doc(`dig_${normalizedReference}`);
+      const doc = await ref.get();
+      if (!doc.exists) {
+        return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: `Digital verification ${normalizedReference} not found.` } });
+      }
+      const data = doc.data();
+      if (String(data?.packageId || "") !== String(packageId)) {
+        return res.status(409).json({ success: false, error: { code: "PACKAGE_MISMATCH", message: "Digital payment reference does not belong to the supplied package." } });
+      }
+
+      const nowStr = new Date().toISOString();
+      const nextDoc = {
+        ...data,
+        amount: amount !== undefined ? Number(amount) : Number(data?.amount || 0),
+        paymentMethod: paymentChannel,
+        verificationStatus: normalizedStatus,
+        status: normalizedStatus.toLowerCase(),
+        verificationNote: String(verificationNote || "").trim() || null,
+        verifiedByUid: req.auth.uid,
+        verifiedAt: nowStr,
+        updatedAt: nowStr
+      };
+      await ref.set(nextDoc, { merge: true });
+      return res.json({ success: true, data: nextDoc });
+    } catch (err: any) {
+      return res.status(err.status || 500).json({ success: false, error: { code: err.code || "SERVER_ERROR", message: err.message } });
     }
   });
 
@@ -3727,96 +4041,105 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
       if (!packageId || !scannedPackageNumber) {
         return res.status(400).json({ success: false, error: { code: "INVALID_ARGUMENT", message: "Missing packageId or scannedPackageNumber" } });
       }
+      const idemKey = String(idempotencyKey || `HANDBACK:${packageId}:${scannedPackageNumber}`).trim();
+      const idemRef = db.collection("idempotencyKeys").doc(idemKey);
+      let responseData: any = null;
+      let alreadyHandedBack = false;
 
-      await checkIdempotency(db, idempotencyKey);
-
-      const pkgRef = db.collection("packages").doc(packageId);
-      const pkgDoc = await pkgRef.get();
-      if (!pkgDoc.exists) {
-        return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: `Package ${packageId} not found` } });
-      }
-
-      const pkgData = pkgDoc.data();
-      const realPkgNum = pkgData?.packageNumber || pkgData?.package_number || "";
-
-      // Exact Barcode Matching Requirement
-      if (scannedPackageNumber !== realPkgNum) {
-        return res.status(400).json({
-          success: false,
-          error: { code: "EXACT_BARCODE_MATCH_REQUIRED", message: `Scanned barcode "${scannedPackageNumber}" does not match exact package number "${realPkgNum}". Partial barcode matching is strictly rejected.` }
-        });
-      }
-
-      // Rider Security Check: Rider can only submit return handback for their own assigned package
-      if (req.auth.role === 'rider') {
-        const assignedRider = pkgData?.assignedRiderId;
-        if (assignedRider !== req.auth.riderId) {
-          return res.status(403).json({
-            success: false,
-            error: { code: "UNAUTHORIZED_RIDER_RETURN", message: "Rider may submit return handback only for their own assigned package." }
-          });
+      await db.runTransaction(async (transaction: any) => {
+        const existingIdem = await transaction.get(idemRef);
+        if (existingIdem.exists) {
+          responseData = existingIdem.data()?.result || null;
+          alreadyHandedBack = Boolean(existingIdem.data()?.alreadyHandedBack);
+          return;
         }
-      }
 
-      const currStatus = (pkgData?.operationalStatus || pkgData?.current_status || "").toLowerCase();
-      if (currStatus === "delivered" || currStatus === "closed") {
-        return res.status(400).json({
-          success: false,
-          error: { code: "INVALID_PACKAGE_STATUS", message: `Delivered or closed package cannot be handed back for return. Status: ${currStatus}` }
+        const pkgRef = db.collection("packages").doc(packageId);
+        const pkgDoc = await transaction.get(pkgRef);
+        if (!pkgDoc.exists) {
+          throw { status: 404, code: "NOT_FOUND", message: `Package ${packageId} not found` };
+        }
+
+        const pkgData = pkgDoc.data();
+        const realPkgNum = pkgData?.packageNumber || pkgData?.package_number || "";
+        if (scannedPackageNumber !== realPkgNum) {
+          throw { status: 400, code: "EXACT_BARCODE_MATCH_REQUIRED", message: `Scanned barcode "${scannedPackageNumber}" does not match exact package number "${realPkgNum}". Partial barcode matching is strictly rejected.` };
+        }
+        if (req.auth.role === "rider" && pkgData?.assignedRiderId !== req.auth.riderId) {
+          throw { status: 403, code: "UNAUTHORIZED_RIDER_RETURN", message: "Rider may submit return handback only for their own assigned package." };
+        }
+        const currStatus = (pkgData?.operationalStatus || pkgData?.current_status || "").toLowerCase();
+        if (currStatus === "delivered" || currStatus === "closed") {
+          throw { status: 400, code: "INVALID_PACKAGE_STATUS", message: `Delivered or closed package cannot be handed back for return. Status: ${currStatus}` };
+        }
+
+        const returnId = `ret_${packageId}`;
+        const returnRef = db.collection("returns").doc(returnId);
+        const existingRetDoc = await transaction.get(returnRef);
+        if (existingRetDoc.exists && existingRetDoc.data()?.returnStatus === "rider_handed_back") {
+          responseData = existingRetDoc.data();
+          alreadyHandedBack = true;
+          transaction.set(idemRef, {
+            key: idemKey,
+            action: "RIDER_RETURN_HANDBACK",
+            result: responseData,
+            alreadyHandedBack: true,
+            createdAt: new Date().toISOString()
+          });
+          return;
+        }
+
+        const nowStr = new Date().toISOString();
+        responseData = {
+          id: returnId,
+          packageId,
+          packageNumber: realPkgNum,
+          riderId: req.auth.riderId,
+          handoffEmployee: handoffEmployee || null,
+          returnReason: returnReason || pkgData?.failureReason || "Failed Delivery Return",
+          quantity: quantity || 1,
+          riderNotes: riderNotes || null,
+          returnStatus: "rider_handed_back",
+          riderHandedBackAt: nowStr,
+          createdAt: existingRetDoc.exists ? (existingRetDoc.data()?.createdAt || nowStr) : nowStr,
+          updatedAt: nowStr
+        };
+        transaction.set(returnRef, responseData, { merge: true });
+
+        const custodyEventId = `cust_${packageId}_rider_handback`;
+        transaction.set(db.collection("returnCustodyEvents").doc(custodyEventId), {
+          id: custodyEventId,
+          returnId,
+          packageId,
+          eventStage: "rider_handed_back",
+          actorUid: req.auth.uid,
+          actorRole: req.auth.role,
+          handoffEmployee: handoffEmployee || null,
+          timestamp: nowStr
         });
-      }
 
-      // Check if duplicate return handback scan
-      const returnId = `ret_${packageId}`;
-      const existingRetDoc = await db.collection("returns").doc(returnId).get();
-      if (existingRetDoc.exists && existingRetDoc.data()?.returnStatus === "rider_handed_back") {
-        return res.json({
-          success: true,
-          data: existingRetDoc.data(),
-          alreadyHandedBack: true,
-          message: `Package ${realPkgNum} already handed back to hub warehouse.`
+        transaction.update(pkgRef, {
+          current_status: "Returning to Warehouse",
+          operationalStatus: "returning_to_warehouse",
+          custodyStage: "return_handed_back",
+          updatedAt: nowStr
         });
-      }
 
-      const nowStr = new Date().toISOString();
-
-      const returnData = {
-        id: returnId,
-        packageId,
-        packageNumber: realPkgNum,
-        riderId: req.auth.riderId,
-        handoffEmployee: handoffEmployee || null,
-        returnReason: returnReason || pkgData?.failureReason || "Failed Delivery Return",
-        quantity: quantity || 1,
-        riderNotes: riderNotes || null,
-        returnStatus: "rider_handed_back",
-        riderHandedBackAt: nowStr,
-        createdAt: nowStr,
-        updatedAt: nowStr
-      };
-
-      await db.collection("returns").doc(returnId).set(returnData, { merge: true });
-
-      const custodyEventId = `cust_${Date.now()}_${Math.random().toString(36).substring(2,6)}`;
-      await db.collection("returnCustodyEvents").doc(custodyEventId).set({
-        id: custodyEventId,
-        returnId,
-        packageId,
-        eventStage: "rider_handed_back",
-        actorUid: req.auth.uid,
-        actorRole: req.auth.role,
-        handoffEmployee: handoffEmployee || null,
-        timestamp: nowStr
+        transaction.set(idemRef, {
+          key: idemKey,
+          action: "RIDER_RETURN_HANDBACK",
+          result: responseData,
+          alreadyHandedBack: false,
+          createdAt: nowStr
+        });
       });
 
-      await pkgRef.update({
-        current_status: "Returning to Warehouse",
-        operationalStatus: "returning_to_warehouse",
-        custodyStage: "return_handed_back",
-        updatedAt: nowStr
+      return res.json({
+        success: true,
+        data: responseData,
+        alreadyHandedBack,
+        message: alreadyHandedBack ? `Package ${scannedPackageNumber} already handed back to hub warehouse.` : undefined
       });
-
-      return res.json({ success: true, data: returnData });
     } catch (err: any) {
       const status = err.status || 400;
       return res.status(status).json({ success: false, error: { code: err.code || "HANDBACK_FAILED", message: err.message } });
@@ -3831,126 +4154,114 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
       if (!packageId || !scannedPackageNumber) {
         return res.status(400).json({ success: false, error: { code: "INVALID_ARGUMENT", message: "Missing packageId or scannedPackageNumber" } });
       }
+      const idemKey = String(idempotencyKey || `WAREHOUSE_RECEIPT:${packageId}:${scannedPackageNumber}`).trim();
+      const idemRef = db.collection("idempotencyKeys").doc(idemKey);
+      let receiptData: any = null;
 
-      await checkIdempotency(db, idempotencyKey);
+      await db.runTransaction(async (transaction: any) => {
+        const existingIdem = await transaction.get(idemRef);
+        if (existingIdem.exists) {
+          receiptData = existingIdem.data()?.result || null;
+          return;
+        }
 
-      const pkgRef = db.collection("packages").doc(packageId);
-      const pkgDoc = await pkgRef.get();
-      if (!pkgDoc.exists) {
-        return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: `Package ${packageId} not found` } });
-      }
+        const pkgRef = db.collection("packages").doc(packageId);
+        const pkgDoc = await transaction.get(pkgRef);
+        if (!pkgDoc.exists) {
+          throw { status: 404, code: "NOT_FOUND", message: `Package ${packageId} not found` };
+        }
+        const pkgData = pkgDoc.data();
+        const realPkgNum = pkgData?.packageNumber || pkgData?.package_number || "";
+        if (scannedPackageNumber !== realPkgNum) {
+          throw { status: 400, code: "EXACT_BARCODE_MATCH_REQUIRED", message: `Scanned barcode "${scannedPackageNumber}" does not match exact package number "${realPkgNum}". Partial barcode matching is strictly rejected.` };
+        }
 
-      const pkgData = pkgDoc.data();
-      const realPkgNum = pkgData?.packageNumber || pkgData?.package_number || "";
+        const returnId = `ret_${packageId}`;
+        const returnRef = db.collection("returns").doc(returnId);
+        const retDoc = await transaction.get(returnRef);
+        const retData = retDoc.exists ? retDoc.data() : null;
+        const currentReturnStatus = String(retData?.returnStatus || pkgData?.custodyStage || "").toLowerCase().replace(/[\s-]+/g, "_");
+        if (currentReturnStatus === "warehouse_received") {
+          throw { status: 409, code: "DUPLICATE_WAREHOUSE_RECEIPT", message: `Warehouse receipt already recorded for package ${packageId}. Duplicate receipt rejected.` };
+        }
 
-      // Exact Barcode Matching Requirement
-      if (scannedPackageNumber !== realPkgNum) {
-        return res.status(400).json({
-          success: false,
-          error: { code: "EXACT_BARCODE_MATCH_REQUIRED", message: `Scanned barcode "${scannedPackageNumber}" does not match exact package number "${realPkgNum}". Partial barcode matching is strictly rejected.` }
+        const validReturnStages = ["rider_handed_back", "courier_returning", "returning_to_warehouse", "return_handed_back"];
+        const opStatus = (pkgData?.operationalStatus || pkgData?.current_status || "").toLowerCase().replace(/[\s-]+/g, "_");
+        const custodyStage = (pkgData?.custodyStage || "").toLowerCase().replace(/[\s-]+/g, "_");
+        const isEligibleReturnStage = validReturnStages.includes(currentReturnStatus) || validReturnStages.includes(opStatus) || validReturnStages.includes(custodyStage);
+        if (!isEligibleReturnStage) {
+          throw { status: 400, code: "WRONG_CUSTODY_ORDER", message: `Warehouse receipt requested out of sequence. Current stage: "${currentReturnStatus || opStatus || custodyStage}". Package must be handed back by rider first.` };
+        }
+
+        const cond = (packageCondition || "sealed").toLowerCase();
+        if ((cond === "damaged" || cond === "missing_item" || cond === "wrong_item") && (!conditionNotes || !conditionNotes.trim())) {
+          throw { status: 400, code: "MISSING_CONDITION_NOTES", message: `Condition "${cond}" requires detailed condition notes.` };
+        }
+
+        const nowStr = new Date().toISOString();
+        const receiptId = `rcpt_${packageId}`;
+        receiptData = {
+          id: receiptId,
+          returnId,
+          packageId,
+          packageNumber: realPkgNum,
+          scannedPackageNumber,
+          receivedQuantity: Number(receivedQuantity) || 1,
+          packageCondition: cond,
+          restockable: restockable !== false,
+          conditionNotes: conditionNotes ? conditionNotes.trim() : null,
+          receivedByUid: req.auth.uid,
+          receivedAt: nowStr,
+          idempotencyKey: idemKey,
+          createdAt: nowStr
+        };
+        transaction.set(db.collection("returnReceipts").doc(receiptId), receiptData);
+        transaction.set(returnRef, {
+          id: returnId,
+          packageId,
+          packageNumber: realPkgNum,
+          returnStatus: "warehouse_received",
+          warehouseReceivedAt: nowStr,
+          updatedAt: nowStr
+        }, { merge: true });
+
+        transaction.set(db.collection("returnCustodyEvents").doc(`cust_${packageId}_warehouse_received`), {
+          id: `cust_${packageId}_warehouse_received`,
+          returnId,
+          packageId,
+          eventStage: "warehouse_received",
+          actorUid: req.auth.uid,
+          actorRole: req.auth.role,
+          timestamp: nowStr
         });
-      }
 
-      const returnId = `ret_${packageId}`;
-      const retDoc = await db.collection("returns").doc(returnId).get();
-      const retData = retDoc.exists ? retDoc.data() : null;
-
-      const currentReturnStatus = retData?.returnStatus || pkgData?.custodyStage || "";
-
-      // Check duplicate receipt
-      const rcptCheck = await db.collection("returnReceipts").where("packageId", "==", packageId).get();
-      if (!rcptCheck.empty || currentReturnStatus === "warehouse_received") {
-        return res.status(400).json({
-          success: false,
-          error: { code: "DUPLICATE_WAREHOUSE_RECEIPT", message: `Warehouse receipt already recorded for package ${packageId}. Duplicate receipt rejected.` }
+        transaction.update(pkgRef, {
+          current_status: "Warehouse Received",
+          operationalStatus: "warehouse_received",
+          custodyStage: "warehouse_return_received",
+          warehouseReceivedAt: nowStr,
+          updatedAt: nowStr
         });
-      }
 
-      // Custody Order Check: must be in return process (rider handed back or courier returning)
-      const validReturnStages = ["rider_handed_back", "courier_returning", "returning_to_warehouse", "return_handed_back"];
-      const opStatus = (pkgData?.operationalStatus || pkgData?.current_status || "").toLowerCase().replace(/[\s-]+/g, "_");
-      const custodyStage = (pkgData?.custodyStage || "").toLowerCase().replace(/[\s-]+/g, "_");
+        transaction.set(db.collection("customerServiceCases").doc(`cs_${packageId}`), {
+          id: `cs_${packageId}`,
+          packageId,
+          packageNumber: realPkgNum,
+          customerId: pkgData?.customerName || pkgData?.recipient_name || "Unknown",
+          caseType: "failed_delivery_review",
+          priority: cond === "damaged" ? "high" : "normal",
+          status: "open",
+          attemptCount: 0,
+          createdAt: nowStr,
+          updatedAt: nowStr
+        }, { merge: true });
 
-      const isEligibleReturnStage = validReturnStages.includes(currentReturnStatus) ||
-                                    validReturnStages.includes(opStatus) ||
-                                    validReturnStages.includes(custodyStage);
-
-      if (!isEligibleReturnStage) {
-        return res.status(400).json({
-          success: false,
-          error: { code: "WRONG_CUSTODY_ORDER", message: `Warehouse receipt requested out of sequence. Current stage: "${currentReturnStatus || opStatus || custodyStage}". Package must be handed back by rider first.` }
+        transaction.set(idemRef, {
+          key: idemKey,
+          action: "WAREHOUSE_RETURN_RECEIPT",
+          result: receiptData,
+          createdAt: nowStr
         });
-      }
-
-      // Condition Notes validation for missing/damaged items
-      const cond = (packageCondition || "sealed").toLowerCase();
-      if ((cond === "damaged" || cond === "missing_item" || cond === "wrong_item") && (!conditionNotes || !conditionNotes.trim())) {
-        return res.status(400).json({
-          success: false,
-          error: { code: "MISSING_CONDITION_NOTES", message: `Condition "${cond}" requires detailed condition notes.` }
-        });
-      }
-
-      const nowStr = new Date().toISOString();
-      const receiptId = `rcpt_${packageId}_${Date.now()}`;
-
-      const receiptData = {
-        id: receiptId,
-        returnId,
-        packageId,
-        packageNumber: realPkgNum,
-        receivedQuantity: Number(receivedQuantity) || 1,
-        packageCondition: cond,
-        restockable: restockable !== false,
-        conditionNotes: conditionNotes ? conditionNotes.trim() : null,
-        receivedByUid: req.auth.uid,
-        receivedAt: nowStr,
-        createdAt: nowStr
-      };
-
-      await db.collection("returnReceipts").doc(receiptId).set(receiptData);
-
-      await db.collection("returns").doc(returnId).set({
-        id: returnId,
-        packageId,
-        packageNumber: realPkgNum,
-        returnStatus: "warehouse_received",
-        warehouseReceivedAt: nowStr,
-        updatedAt: nowStr
-      }, { merge: true });
-
-      const custodyEventId = `cust_${Date.now()}_${Math.random().toString(36).substring(2,6)}`;
-      await db.collection("returnCustodyEvents").doc(custodyEventId).set({
-        id: custodyEventId,
-        returnId,
-        packageId,
-        eventStage: "warehouse_received",
-        actorUid: req.auth.uid,
-        actorRole: req.auth.role,
-        timestamp: nowStr
-      });
-
-      await pkgRef.update({
-        current_status: "Warehouse Received",
-        operationalStatus: "warehouse_received",
-        custodyStage: "warehouse_return_received",
-        warehouseReceivedAt: nowStr,
-        updatedAt: nowStr
-      });
-
-      // Automatically create a Customer Service Case for CS Review
-      const csCaseId = `cs_${packageId}_${Date.now()}`;
-      await db.collection("customerServiceCases").doc(csCaseId).set({
-        id: csCaseId,
-        packageId,
-        packageNumber: realPkgNum,
-        customerId: pkgData?.customerName || pkgData?.recipient_name || "Unknown",
-        caseType: "failed_delivery_review",
-        priority: cond === "damaged" ? "high" : "normal",
-        status: "open",
-        attemptCount: 0,
-        createdAt: nowStr,
-        updatedAt: nowStr
       });
 
       return res.json({ success: true, data: receiptData });
@@ -4821,6 +5132,9 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
 
   // --- LOGISTICS HUB API ---
   app.use("/api/logistics", createLogisticsRouter(db, requireAuth, requireRole));
+
+  // --- MANAGEMENT COMMAND CENTER ANALYTICS API ---
+  app.use("/api/management", createManagementRouter(db, requireAuth, requireRole));
 
   // --- SUPER ADMIN USER MANAGEMENT API ---
   app.use("/api/admin", createAdminUserRouter(db, adminAuth, requireAuth, requireExactRole, adminUserTestHooks));

@@ -137,16 +137,21 @@ export function RiderEndOfDayFlow({
   }, 0);
 
   // Total Cash already submitted in settlements
-  const cashAlreadySubmitted = settlements.reduce((sum: number, s: any) => {
+  const handoverSubmitted = settlements.reduce((sum: number, s: any) => {
     if (s.status !== 'rejected') {
-      const val = s.physicallyReceivedAmount > 0 ? s.physicallyReceivedAmount : (s.declaredCashAmount || 0);
-      return sum + Number(val);
+      return sum + Number(s.declaredCashAmount || 0);
+    }
+    return sum;
+  }, 0);
+  const cashierConfirmed = settlements.reduce((sum: number, s: any) => {
+    if (s.status !== 'rejected') {
+      return sum + Number(s.physicallyReceivedAmount || 0);
     }
     return sum;
   }, 0);
 
   // Physical Cash Currently With Rider
-  const cashWithRider = Math.max(0, totalCodCollected - cashAlreadySubmitted);
+  const cashWithRider = Math.max(0, totalCodCollected - cashierConfirmed);
 
   // ----------------------------------------------------
   // VALIDATION EVALUATION
@@ -695,14 +700,21 @@ export function RiderEndOfDayFlow({
               </div>
 
               <div className="flex items-center justify-between pt-2">
-                <span className="text-[#6D6964]">Already Handed Over</span>
+                <span className="text-[#6D6964]">Handover Submitted</span>
                 <span className="font-mono font-bold text-amber-700">
-                  Rs. {cashAlreadySubmitted.toLocaleString()}
+                  Rs. {handoverSubmitted.toLocaleString()}
                 </span>
               </div>
 
               <div className="flex items-center justify-between pt-2">
-                <span className="text-base font-black text-[#1F1F1D]">Balance Due</span>
+                <span className="text-[#6D6964]">Cashier Confirmed</span>
+                <span className="font-mono font-bold text-sky-700">
+                  Rs. {cashierConfirmed.toLocaleString()}
+                </span>
+              </div>
+
+              <div className="flex items-center justify-between pt-2">
+                <span className="text-base font-black text-[#1F1F1D]">Outstanding Cash</span>
                 <span className="font-mono text-base font-black text-[#5A2628]">
                   Rs. {cashWithRider.toLocaleString()}
                 </span>

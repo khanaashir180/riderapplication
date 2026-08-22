@@ -701,14 +701,16 @@ export interface RiderSettlement {
   calculatedCashObligation: number;
   declaredCashAmount: number;
   physicallyReceivedAmount: number;
+  collectionVariance?: number;
   riderHandoverVariance: number;
   cashierVariance: number;
   totalSettlementVariance: number;
+  unresolvedCollectionDiscrepancyCount?: number;
 
   status: SettlementStatus;
 
   // Discrepancy details
-  discrepancyType?: 'NONE' | 'SHORT' | 'EXCESS' | 'DECLARATION_MISMATCH';
+  discrepancyType?: 'NONE' | 'SHORT' | 'EXCESS' | 'DECLARATION_MISMATCH' | 'COLLECTION_VARIANCE';
   discrepancyAmount?: number;
   discrepancyReason?: string;
   resolutionType?: 'RECOVERED_FROM_RIDER' | 'APPROVED_WRITE_OFF' | 'ACCOUNTING_CORRECTION' | 'SYSTEM_CORRECTION' | 'OTHER_APPROVED';
@@ -869,7 +871,8 @@ export interface CODCollectionDoc {
   digitalReference: string | null;
   collectionVariance: number;
   idempotencyKey: string;
-  transactionId: string;
+  transactionId: string | null;
+  discrepancyId?: string | null;
   createdAt: string;
 }
 
@@ -879,8 +882,11 @@ export interface DigitalPaymentVerificationDoc {
   packageId: string;
   paymentMethod: string;
   amount: number;
-  status: "pending" | "verified" | "rejected";
+  status: "pending" | "verified" | "mismatch" | "rejected";
+  verificationStatus?: "PENDING" | "VERIFIED" | "MISMATCH" | "REJECTED";
+  verificationNote?: string | null;
   verifiedByUid: string | null;
+  verifiedAt?: string | null;
   createdAt: string;
 }
 
@@ -903,7 +909,10 @@ export interface RiderSettlementDoc {
   collectionVariance: number;
   riderHandoverVariance: number;
   cashierVariance: number;
+  totalSettlementVariance?: number;
+  unresolvedCollectionDiscrepancyCount?: number;
   discrepancyAmount: number;
+  discrepancyType?: 'NONE' | 'SHORT' | 'EXCESS' | 'DECLARATION_MISMATCH' | 'COLLECTION_VARIANCE';
   discrepancyReason: string | null;
   notes: string | null;
   receiptNotes: string | null;
@@ -921,6 +930,9 @@ export interface SettlementLineDoc {
   settlementId: string;
   packageId: string;
   collectedAmount: number;
+  expectedCod?: number;
+  collectionVariance?: number;
+  discrepancyId?: string | null;
   paymentMethod: string;
   createdAt: string;
 }
