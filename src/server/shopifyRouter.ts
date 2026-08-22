@@ -233,6 +233,7 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
       total_price: order.totalPriceSet?.shopMoney?.amount,
       current_total_price: order.currentTotalPriceSet?.shopMoney?.amount,
       total_outstanding: order.totalOutstandingSet?.shopMoney?.amount,
+      amount_paid: Math.max(0, Number(order.currentTotalPriceSet?.shopMoney?.amount || order.totalPriceSet?.shopMoney?.amount || 0) - Number(order.totalOutstandingSet?.shopMoney?.amount || 0)),
       financial_status: String(order.financialStatus || "").toLowerCase(),
       payment_gateway_names: order.paymentGatewayNames || [],
       line_items: (order.lineItems?.nodes || []).map((item: any) => ({ ...item, variant_id: item.variant?.id, variant_title: item.variantTitle, price: item.originalUnitPriceSet?.shopMoney?.amount })),
@@ -270,23 +271,11 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
       const isMissingCity = !rawCity;
       const isMissingAddress = !address;
 
-      const totalAmount = Math.round(Number(ord.total_price || 0));
+      const payment = normalizeShopifyPayment(ord);
+      const totalAmount = payment.total;
       const financialStatus = ord.financial_status || "pending";
-      const isPrepaid = financialStatus === "paid";
-
-      let codExpected = 0;
-      let paymentMethod = "cod";
-      let paymentStatus = "unpaid";
-
-      if (isPrepaid) {
-        paymentMethod = "paid";
-        paymentStatus = "paid";
-        codExpected = 0;
-      } else {
-        paymentMethod = "cod";
-        paymentStatus = "unpaid";
-        codExpected = Math.round(Number(ord.total_outstanding || ord.current_total_price || ord.total_price || 0));
-      }
+      const isPrepaid = payment.paymentType === "PREPAID";
+      const codExpected = payment.codExpected;
 
       // Delivery channel classification - if missing city, flag for review
       let deliveryChannel = "unassigned";
@@ -333,9 +322,11 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
         province,
         email: customer.email || ord.email || null,
         deliveryInstructions: ord.note || null,
-        paymentMethod,
-        paymentType: isPrepaid ? "PREPAID" : (financialStatus === "partially_paid" ? "PARTIALLY_PAID" : "COD"),
-        paymentStatus,
+        paymentMethod: payment.paymentMethod,
+        paymentType: payment.paymentType,
+        paymentStatus: payment.paymentStatus,
+        amountPaid: payment.amountPaid,
+        amountOutstanding: payment.amountOutstanding,
         financialStatus,
         orderAmount: totalAmount,
         codExpected,
