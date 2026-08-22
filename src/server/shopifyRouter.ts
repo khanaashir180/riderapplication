@@ -77,7 +77,8 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
       const expectedTopics = ["ORDERS_CREATE", "ORDERS_UPDATED", "ORDERS_EDITED", "ORDERS_CANCELLED", "ORDERS_PAID", "REFUNDS_CREATE"];
       const results = [];
       for (const topic of expectedTopics) {
-        results.push(await shopifyGraphQL(config, "mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $callbackUrl: URL!) { webhookSubscriptionCreate(topic: $topic, webhookSubscription: { callbackUrl: $callbackUrl }) { userErrors { field message } webhookSubscription { id topic } } }", { topic, callbackUrl }));
+        const topicCallbackUrl = `${callbackUrl.replace(/\/+$/, "")}/${topic}`;
+        results.push(await shopifyGraphQL(config, "mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $callbackUrl: URL!) { webhookSubscriptionCreate(topic: $topic, webhookSubscription: { callbackUrl: $callbackUrl }) { userErrors { field message } webhookSubscription { id topic } } }", { topic, callbackUrl: topicCallbackUrl }));
       }
       return res.json({ success: true, data: { repaired: results.length, results } });
     } catch (err: any) { return res.status(502).json({ success: false, error: { code: "SHOPIFY_SUBSCRIPTION_REPAIR_FAILED", message: err.message } }); }
