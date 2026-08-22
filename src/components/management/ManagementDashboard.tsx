@@ -46,17 +46,17 @@ export function ManagementDashboard({ onSelectOrder }: ManagementDashboardProps)
   // MAX TWO CHARTS:
   // Chart 1: Delivery Status Breakdown (Bar chart)
   const chartDataStatus = [
-    { name: 'Delivered', count: summary.totalDelivered ?? 0 },
-    { name: 'In Transit', count: summary.outForDelivery ?? 0 },
-    { name: 'Unassigned', count: summary.awaitingAssignment ?? 0 },
-    { name: 'Returned', count: summary.totalReturned ?? 0 }
+    { name: 'Assigned Today', count: summary.assignedToday ?? 0 },
+    { name: 'Delivered Today', count: summary.deliveredToday ?? 0 },
+    { name: 'Failed Today', count: summary.failedToday ?? 0 },
+    { name: 'Returned Today', count: summary.returnedToday ?? 0 }
   ];
 
   // Chart 2: COD Settlement Balance (Pie chart)
   const chartDataCOD = [
     { name: 'Settled COD', value: summary.totalSettledCod ?? 0, color: '#1F7A52' },
-    { name: 'Rider Cash Held', value: summary.codHeldByRiders ?? 0, color: '#A56716' },
-    { name: 'Discrepancies', value: summary.codDiscrepancies ?? 0, color: '#B43B3B' }
+    { name: 'Cash With Riders', value: summary.codHeldByRiders ?? 0, color: '#A56716' },
+    { name: 'Unsettled COD', value: summary.unsettledCod ?? 0, color: '#B43B3B' }
   ];
 
   const exceptions = recentOrders.filter(o => ['Customer Unavailable', 'Refused', 'Rescheduled'].includes(o.current_status));
@@ -71,7 +71,7 @@ export function ManagementDashboard({ onSelectOrder }: ManagementDashboardProps)
           <p className="text-xs text-[#6D6964]">High-level operational performance metrics for Gomila Intersole LMS</p>
         </div>
         <span className="text-[10px] font-mono text-[#6D6964] bg-[#F5F4F2] px-2.5 py-1 rounded border border-[#DDD9D4]">
-          Real-Time Audit Sync Active
+          Karachi Day: {summary.reportingDay || 'Live'}
         </span>
       </div>
 
@@ -80,11 +80,11 @@ export function ManagementDashboard({ onSelectOrder }: ManagementDashboardProps)
         
         <div className="bg-white p-4 rounded-lg border border-[#DDD9D4] shadow-xs space-y-1">
           <div className="flex justify-between items-center text-[#6D6964]">
-            <span className="text-xs font-semibold">Delivery Success</span>
+            <span className="text-xs font-semibold">Assigned Today</span>
             <CheckCircle2 className="w-4 h-4 text-[#1F7A52]" />
           </div>
-          <span className="text-2xl font-black text-[#1F1F1D]">{summary.successPercentage}</span>
-          <p className="text-[10px] text-[#6D6964]">Of total dispatched packages</p>
+          <span className="text-2xl font-black text-[#1F1F1D]">{summary.assignedToday ?? 0}</span>
+          <p className="text-[10px] text-[#6D6964]">Assignments created within today only</p>
         </div>
 
         <div className="bg-white p-4 rounded-lg border border-[#DDD9D4] shadow-xs space-y-1">
@@ -109,53 +109,53 @@ export function ManagementDashboard({ onSelectOrder }: ManagementDashboardProps)
 
         <div className="bg-white p-4 rounded-lg border border-[#DDD9D4] shadow-xs space-y-1">
           <div className="flex justify-between items-center text-[#6D6964]">
-            <span className="text-xs font-semibold">COD Unsettled</span>
+            <span className="text-xs font-semibold">Cash With Riders</span>
             <DollarSign className="w-4 h-4 text-[#A56716]" />
           </div>
           <span className="text-xl font-black text-[#A56716] font-mono">
             Rs. {(summary.codHeldByRiders || 0).toLocaleString()}
           </span>
-          <p className="text-[10px] text-[#6D6964]">Held by riders pending deposit</p>
+          <p className="text-[10px] text-[#6D6964]">Net rider wallet exposure</p>
         </div>
 
         <div className="bg-white p-4 rounded-lg border border-[#DDD9D4] shadow-xs space-y-1">
           <div className="flex justify-between items-center text-[#6D6964]">
-            <span className="text-xs font-semibold">Cash Discrepancies</span>
+            <span className="text-xs font-semibold">Open Shortage</span>
             <AlertTriangle className="w-4 h-4 text-[#B43B3B]" />
           </div>
           <span className="text-xl font-black text-[#B43B3B] font-mono">
-            Rs. {(summary.codDiscrepancies || 0).toLocaleString()}
+            Rs. {(summary.openShortage || 0).toLocaleString()}
           </span>
-          <p className="text-[10px] text-[#B43B3B] font-bold">Requires cashier audit</p>
+          <p className="text-[10px] text-[#B43B3B] font-bold">Unresolved shortage only</p>
         </div>
 
         <div className="bg-white p-4 rounded-lg border border-[#DDD9D4] shadow-xs space-y-1">
           <div className="flex justify-between items-center text-[#6D6964]">
-            <span className="text-xs font-semibold">Orders Overdue</span>
+            <span className="text-xs font-semibold">Cashier Received</span>
             <Clock className="w-4 h-4 text-[#B43B3B]" />
           </div>
-          <span className="text-2xl font-black text-[#1F1F1D]">
-            {summary.aging?.pending48 ?? 0}
+          <span className="text-xl font-black text-[#1F1F1D] font-mono">
+            Rs. {(summary.cashierReceived || 0).toLocaleString()}
           </span>
-          <p className="text-[10px] text-[#6D6964]">Passed promised date</p>
+          <p className="text-[10px] text-[#6D6964]">Physical receipts confirmed today</p>
         </div>
 
         <div className="bg-white p-4 rounded-lg border border-[#DDD9D4] shadow-xs space-y-1">
           <div className="flex justify-between items-center text-[#6D6964]">
-            <span className="text-xs font-semibold">Total Delivered</span>
+            <span className="text-xs font-semibold">Delivered Today</span>
             <Users className="w-4 h-4 text-[#356A8A]" />
           </div>
-          <span className="text-2xl font-black text-[#1F1F1D]">{summary.totalDelivered ?? 0}</span>
-          <p className="text-[10px] text-[#6D6964]">Packages completed</p>
+          <span className="text-2xl font-black text-[#1F1F1D]">{summary.deliveredToday ?? 0}</span>
+          <p className="text-[10px] text-[#6D6964]">Today-scoped successful drops</p>
         </div>
 
         <div className="bg-white p-4 rounded-lg border border-[#DDD9D4] shadow-xs space-y-1">
           <div className="flex justify-between items-center text-[#6D6964]">
-            <span className="text-xs font-semibold">3PL Receivables</span>
+            <span className="text-xs font-semibold">Open Excess</span>
             <Building2 className="w-4 h-4 text-[#5A2628]" />
           </div>
-          <span className="text-xl font-black text-[#1F1F1D] font-mono">Rs. 0</span>
-          <p className="text-[10px] text-[#6D6964]">External courier COD pending</p>
+          <span className="text-xl font-black text-[#1F1F1D] font-mono">Rs. {(summary.openExcess || 0).toLocaleString()}</span>
+          <p className="text-[10px] text-[#6D6964]">Unresolved excess cash</p>
         </div>
 
       </div>

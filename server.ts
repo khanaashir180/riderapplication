@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { createServer as createViteServer } from "vite";
@@ -257,6 +258,108 @@ async function seedFinancialAccounts(db: any) {
   }
 }
 
+function normalizeDigitalReference(reference: string) {
+  return reference.trim().toUpperCase().replace(/[\s-]+/g, "");
+}
+
+function isValidCoordinate(value: unknown, min: number, max: number) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed >= min && parsed <= max;
+}
+
+function isDataUrl(value: string | undefined | null) {
+  return typeof value === "string" && value.trim().toLowerCase().startsWith("data:");
+}
+
+function timingSafeSecretMatch(actualHeader: unknown, configuredSecret: string) {
+  if (typeof actualHeader !== "string") return false;
+  const presented = actualHeader.trim();
+  if (!presented || !configuredSecret) return false;
+  const presentedBuffer = Buffer.from(presented);
+  const configuredBuffer = Buffer.from(configuredSecret);
+  if (presentedBuffer.length !== configuredBuffer.length) {
+    return false;
+  }
+  return crypto.timingSafeEqual(presentedBuffer, configuredBuffer);
+}
+
+function getAsiaKarachiDayRange(now = new Date()) {
+  const formatter = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Karachi",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit"
+  });
+  const parts = formatter.formatToParts(now);
+  const year = parts.find((part) => part.type === "year")?.value;
+  const month = parts.find((part) => part.type === "month")?.value;
+  const day = parts.find((part) => part.type === "day")?.value;
+  const dayString = `${year}-${month}-${day}`;
+  return {
+    dayString,
+    startIso: `${dayString}T00:00:00+05:00`,
+    endIso: `${dayString}T23:59:59.999+05:00`
+  };
+}
+
+function isIsoWithinRange(value: unknown, startIso: string, endIso: string) {
+  if (typeof value !== "string" || !value.trim()) return false;
+  const ts = Date.parse(value);
+  return Number.isFinite(ts) && ts >= Date.parse(startIso) && ts <= Date.parse(endIso);
+}
+
+function isPackageStateBlockedForManifest(statusValue: unknown) {
+  const normalized = String(statusValue || "").toLowerCase().replace(/[\s-]+/g, "_");
+  return [
+    "cancelled",
+    "customer_cancelled",
+    "delivered",
+    "return_required",
+    "returning_to_warehouse",
+    "returned",
+    "transferred"
+  ].includes(normalized);
+}
+
+function buildSettlementResolutionPostings(settlement: any, resolutionType: string) {
+  const variance = Number(settlement.totalSettlementVariance ?? settlement.discrepancyAmount ?? 0);
+  const amount = Math.abs(variance);
+  if (amount <= 0) {
+    throw { status: 400, code: "NO_OPEN_DISCREPANCY", message: "Settlement has no open discrepancy to resolve." };
+  }
+
+  if (variance < 0) {
+    if (resolutionType === "RECOVERED_FROM_RIDER") {
+      return [
+        { accountCode: "CASHIER_CASH_CONTROL", debitAmount: amount, creditAmount: 0 },
+        { accountCode: "RIDER_CASH_WALLET", debitAmount: 0, creditAmount: amount }
+      ];
+    }
+    if (resolutionType === "APPROVED_WRITE_OFF") {
+      return [
+        { accountCode: "APPROVED_WRITE_OFF", debitAmount: amount, creditAmount: 0 },
+        { accountCode: "RIDER_CASH_WALLET", debitAmount: 0, creditAmount: amount }
+      ];
+    }
+    if (resolutionType === "ACCOUNTING_CORRECTION" || resolutionType === "SYSTEM_CORRECTION") {
+      return [
+        { accountCode: "COD_DISCREPANCY", debitAmount: amount, creditAmount: 0 },
+        { accountCode: "RIDER_CASH_WALLET", debitAmount: 0, creditAmount: amount }
+      ];
+    }
+    throw { status: 400, code: "INVALID_RESOLUTION_TYPE", message: `Resolution type "${resolutionType}" is not valid for a shortage.` };
+  }
+
+  if (resolutionType === "ACCOUNTING_CORRECTION" || resolutionType === "SYSTEM_CORRECTION") {
+    return [
+      { accountCode: "RIDER_CASH_WALLET", debitAmount: amount, creditAmount: 0 },
+      { accountCode: "COD_DISCREPANCY", debitAmount: 0, creditAmount: amount }
+    ];
+  }
+
+  throw { status: 400, code: "INVALID_RESOLUTION_TYPE", message: `Resolution type "${resolutionType}" is not valid for an excess.` };
+}
+
 async function createDoubleEntryTransaction(db: any, params: {
   transactionType: string;
   sourceType: string;
@@ -283,10 +386,6 @@ async function createDoubleEntryTransaction(db: any, params: {
   }
 
   const idemRef = db.collection("idempotencyKeys").doc(params.idempotencyKey);
-  const idemDoc = await idemRef.get();
-  if (idemDoc.exists) {
-    throw { status: 409, code: "DUPLICATE_IDEMPOTENCY_KEY", message: `Duplicate idempotency key "${params.idempotencyKey}" rejected` };
-  }
 
   if (!params.postings || !Array.isArray(params.postings) || params.postings.length === 0) {
     throw { status: 400, code: "INVALID_POSTINGS", message: "Transaction must contain at least one posting line" };
@@ -339,9 +438,19 @@ async function createDoubleEntryTransaction(db: any, params: {
   const nowStr = new Date().toISOString();
 
   await db.runTransaction(async (t: any) => {
+    const existingIdem = await t.get(idemRef);
+    if (existingIdem.exists) {
+      throw { status: 409, code: "DUPLICATE_IDEMPOTENCY_KEY", message: `Duplicate idempotency key "${params.idempotencyKey}" rejected` };
+    }
+
     t.set(idemRef, {
       key: params.idempotencyKey,
       action: params.transactionType,
+      result: {
+        transactionId: txId,
+        sourceType: params.sourceType,
+        sourceId: params.sourceId
+      },
       createdAt: nowStr
     });
 
@@ -1663,75 +1772,83 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         }
       }
 
-      // 2. Validate all packages: must exist, belong to this rider, not in active run, not completed
-      const activeRunsSnap = await db.collection("dispatchRuns")
-        .where("status", "in", ["draft", "ready_for_scan", "in_progress", "accepted_by_rider", "handoff_pending"])
-        .get();
-      const existingActivePackageIds = new Set<string>();
-      activeRunsSnap.docs.forEach(d => {
-        const rData = d.data();
-        (rData.expectedPackages || []).forEach((pid: string) => existingActivePackageIds.add(pid));
-      });
-
-      let expectedCod = 0;
-      for (const pkgId of packageIds) {
-        const pkgDoc = await db.collection("packages").doc(pkgId).get();
-        if (!pkgDoc.exists) {
-          return res.status(404).json({ success: false, error: { code: "PACKAGE_NOT_FOUND", message: `Package ${pkgId} not found` } });
-        }
-        const d = pkgDoc.data();
-        if (!d?.assignedRiderId || d.assignedRiderId !== riderId) {
-          return res.status(400).json({
-            success: false,
-            error: {
-              code: "WRONG_RIDER_PACKAGE",
-              message: `Package ${pkgId} is ${d?.assignedRiderId ? `assigned to rider ${d.assignedRiderId}` : 'not assigned to any rider'}, but run is for rider ${riderId}`
-            }
-          });
-        }
-        const currStatus = (d?.operationalStatus || d?.current_status || "").toUpperCase();
-        if (["DELIVERED", "RETURNED", "CANCELLED", "CLOSED", "RETURNING_TO_WAREHOUSE"].includes(currStatus)) {
-          return res.status(400).json({ success: false, error: { code: "INVALID_PACKAGE_STATUS", message: `Package ${pkgId} is in completed status ${currStatus}` } });
-        }
-        if (existingActivePackageIds.has(pkgId)) {
-          return res.status(400).json({ success: false, error: { code: "PACKAGE_IN_ACTIVE_RUN", message: `Package ${pkgId} is already in an active dispatch run` } });
-        }
-        expectedCod += (d?.cod_expected || d?.expectedCod || d?.codExpected || 0);
-      }
-
       const runUuid = crypto.randomUUID();
       const runId = `run_${runUuid}`;
       const runNumber = `RUN-${runUuid.slice(0, 8).toUpperCase()}`;
       const nowStr = new Date().toISOString();
+      let runData: any;
 
-      const runData = {
-        id: runId,
-        runId,
-        runNumber,
-        riderId,
-        vehicle: vehicle || "Motorbike",
-        shift: shift || "Morning",
-        dispatchDate: dispatchDate || nowStr.split("T")[0],
-        expectedPackages: packageIds,
-        expectedCod,
-        scannedPackages: [],
-        missingPackages: [],
-        preparedBy: req.auth.uid,
-        handedOverBy: null,
-        acceptedByRider: false,
-        status: "draft",
-        startTimestamp: null,
-        endTimestamp: null,
-        createdAt: nowStr,
-        updatedAt: nowStr
-      };
+      await db.runTransaction(async (transaction: any) => {
+        let expectedCod = 0;
+        const packageRefs = packageIds.map((pkgId: string) => db.collection("packages").doc(pkgId));
+        const packageDocs = await Promise.all(packageRefs.map((pkgRef: any) => transaction.get(pkgRef)));
 
-      await db.collection("dispatchRuns").doc(runId).set(runData);
+        for (let index = 0; index < packageIds.length; index++) {
+          const pkgId = packageIds[index];
+          const pkgDoc = packageDocs[index];
+          if (!pkgDoc.exists) {
+            throw { status: 404, code: "PACKAGE_NOT_FOUND", message: `Package ${pkgId} not found` };
+          }
+
+          const d = pkgDoc.data();
+          if (!d?.assignedRiderId || d.assignedRiderId !== riderId) {
+            throw {
+              status: 400,
+              code: "WRONG_RIDER_PACKAGE",
+              message: `Package ${pkgId} is ${d?.assignedRiderId ? `assigned to rider ${d.assignedRiderId}` : "not assigned to any rider"}, but run is for rider ${riderId}`
+            };
+          }
+
+          const currStatus = (d?.operationalStatus || d?.current_status || "").toUpperCase();
+          if (["DELIVERED", "RETURNED", "CANCELLED", "CLOSED", "RETURNING_TO_WAREHOUSE"].includes(currStatus)) {
+            throw { status: 400, code: "INVALID_PACKAGE_STATUS", message: `Package ${pkgId} is in completed status ${currStatus}` };
+          }
+
+          if (d?.activeDispatchRunId && d.activeDispatchRunId !== runId) {
+            throw { status: 400, code: "PACKAGE_IN_ACTIVE_RUN", message: `Package ${pkgId} is already in active dispatch run ${d.activeDispatchRunId}` };
+          }
+
+          expectedCod += Number(d?.cod_expected || d?.expectedCod || d?.codExpected || 0);
+        }
+
+        runData = {
+          id: runId,
+          runId,
+          runNumber,
+          riderId,
+          vehicle: vehicle || "Motorbike",
+          shift: shift || "Morning",
+          dispatchDate: dispatchDate || nowStr.split("T")[0],
+          expectedPackages: packageIds,
+          expectedCod,
+          scannedPackages: [],
+          missingPackages: [],
+          preparedBy: req.auth.uid,
+          handedOverBy: null,
+          acceptedByRider: false,
+          status: "draft",
+          startTimestamp: null,
+          endTimestamp: null,
+          createdAt: nowStr,
+          updatedAt: nowStr
+        };
+
+        transaction.set(db.collection("dispatchRuns").doc(runId), runData);
+        packageRefs.forEach((pkgRef: any, index: number) => {
+          transaction.update(pkgRef, {
+            activeDispatchRunId: runId,
+            activeDispatchRunNumber: runNumber,
+            activeDispatchRunLockedAt: nowStr,
+            updatedAt: nowStr
+          });
+        });
+      });
 
       // Note: Creating a run MUST NOT automatically mark packages Out for Delivery!
       return res.json({ success: true, data: runData });
     } catch (err: any) {
-      return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: err.message } });
+      const status = err.status || 500;
+      return res.status(status).json({ success: false, error: { code: err.code || "SERVER_ERROR", message: err.message } });
     }
   });
 
@@ -1973,7 +2090,105 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
   // Dedicated Rider Manifest Acceptance Endpoint
   app.post("/api/dispatch/runs/:runId/accept", requireAuth, requireExactRole("rider"), async (req: any, res: any) => {
     const { runId } = req.params;
-    const { discrepancyOverrideReason } = req.body || {};
+
+    try {
+      const runRef = db.collection("dispatchRuns").doc(runId);
+      let responseData: any;
+
+      await db.runTransaction(async (transaction: any) => {
+        const runDoc = await transaction.get(runRef);
+        if (!runDoc.exists) {
+          throw { status: 404, code: "NOT_FOUND", message: `Dispatch run ${runId} not found` };
+        }
+        const runData = runDoc.data();
+
+        if (runData?.riderId !== req.auth.riderId) {
+          throw { status: 403, code: "FORBIDDEN", message: "Rider can only accept their own dispatch run manifest." };
+        }
+
+        const expected: string[] = runData?.expectedPackages || [];
+        const scanned: string[] = runData?.scannedPackages || [];
+        const hasMismatch = expected.length !== scanned.length || expected.some((id: string) => !scanned.includes(id));
+
+        let approvedOverride: any = null;
+        if (hasMismatch) {
+          const overrideQuery = db.collection("manifestDiscrepancyOverrides")
+            .where("runId", "==", runId)
+            .where("status", "==", "approved")
+            .limit(1);
+          const overrideSnap = await transaction.get(overrideQuery);
+          approvedOverride = overrideSnap.empty ? null : overrideSnap.docs[0].data();
+          if (!approvedOverride) {
+            throw {
+              status: 409,
+              code: "MANIFEST_MISMATCH",
+              message: `Manifest scan count (${scanned.length}) does not match expected package count (${expected.length}). All packages must be scanned before acceptance or manager override required.`
+            };
+          }
+        }
+
+        const packageRefs = expected.map((pid: string) => db.collection("packages").doc(pid));
+        const packageDocs = await Promise.all(packageRefs.map((pkgRef: any) => transaction.get(pkgRef)));
+        const nowStr = new Date().toISOString();
+
+        for (let index = 0; index < expected.length; index++) {
+          const pid = expected[index];
+          const pkgDoc = packageDocs[index];
+          if (!pkgDoc.exists) {
+            throw { status: 404, code: "PACKAGE_NOT_FOUND", message: `Package ${pid} not found during acceptance revalidation.` };
+          }
+
+          const pkgData = pkgDoc.data();
+          if (pkgData?.assignedRiderId !== req.auth.riderId) {
+            throw { status: 409, code: "PACKAGE_REASSIGNED", message: `Package ${pid} is no longer assigned to rider ${req.auth.riderId}.` };
+          }
+          if (pkgData?.activeDispatchRunId && pkgData.activeDispatchRunId !== runId) {
+            throw { status: 409, code: "PACKAGE_IN_ACTIVE_RUN", message: `Package ${pid} is locked by another active dispatch run.` };
+          }
+          if (isPackageStateBlockedForManifest(pkgData?.operationalStatus || pkgData?.current_status)) {
+            throw { status: 409, code: "PACKAGE_STATE_CHANGED", message: `Package ${pid} changed state and can no longer move out for delivery.` };
+          }
+        }
+
+        transaction.update(runRef, {
+          status: "accepted_by_rider",
+          acceptedByRider: true,
+          startTimestamp: nowStr,
+          acceptedAt: nowStr,
+          approvedDiscrepancyOverrideId: approvedOverride?.id || null,
+          updatedAt: nowStr
+        });
+
+        packageRefs.forEach((pRef: any) => {
+          transaction.update(pRef, {
+            current_status: "Out for Delivery",
+            operationalStatus: "out_for_delivery",
+            custodyStage: "rider_accepted",
+            custody_stage: "rider_accepted",
+            dispatchedAt: nowStr,
+            updatedAt: nowStr
+          });
+        });
+
+        responseData = {
+          ...runData,
+          status: "accepted_by_rider",
+          acceptedByRider: true,
+          acceptedAt: nowStr,
+          approvedDiscrepancyOverrideId: approvedOverride?.id || null
+        };
+      });
+
+      return res.json({ success: true, data: responseData });
+    } catch (err: any) {
+      const status = err.status || 500;
+      return res.status(status).json({ success: false, error: { code: err.code || "SERVER_ERROR", message: err.message } });
+    }
+  });
+
+  app.post("/api/dispatch/runs/:runId/manifest-discrepancies/report", requireAuth, requireExactRole("rider"), async (req: any, res: any) => {
+    const { runId } = req.params;
+    const { note, expectedPackages, scannedPackages } = req.body || {};
 
     try {
       const runRef = db.collection("dispatchRuns").doc(runId);
@@ -1982,54 +2197,59 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: `Dispatch run ${runId} not found` } });
       }
       const runData = runDoc.data();
-
       if (runData?.riderId !== req.auth.riderId) {
-        return res.status(403).json({ success: false, error: { code: "FORBIDDEN", message: "Rider can only accept their own dispatch run manifest." } });
+        return res.status(403).json({ success: false, error: { code: "FORBIDDEN", message: "Rider can only report discrepancy on their own dispatch run." } });
       }
 
-      const expected: string[] = runData?.expectedPackages || [];
-      const scanned: string[] = runData?.scannedPackages || [];
-      const hasMismatch = expected.length !== scanned.length || expected.some((id: string) => !scanned.includes(id));
+      const overrideId = `mdo_${runId}_${Date.now()}`;
+      const nowStr = new Date().toISOString();
+      const discrepancyDoc = {
+        id: overrideId,
+        runId,
+        riderId: req.auth.riderId,
+        reportedByUid: req.auth.uid,
+        status: "reported",
+        note: note?.trim() || null,
+        expectedPackages: Array.isArray(expectedPackages) ? expectedPackages : runData?.expectedPackages || [],
+        scannedPackages: Array.isArray(scannedPackages) ? scannedPackages : runData?.scannedPackages || [],
+        reportedAt: nowStr,
+        approvedAt: null,
+        approvedByUid: null
+      };
+      await db.collection("manifestDiscrepancyOverrides").doc(overrideId).set(discrepancyDoc);
+      return res.json({ success: true, data: discrepancyDoc });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: { code: err.code || "SERVER_ERROR", message: err.message } });
+    }
+  });
 
-      if (hasMismatch && !discrepancyOverrideReason) {
-        return res.status(409).json({
-          success: false,
-          error: {
-            code: "MANIFEST_MISMATCH",
-            message: `Manifest scan count (${scanned.length}) does not match expected package count (${expected.length}). All packages must be scanned before acceptance or manager override required.`
-          }
-        });
+  app.post("/api/dispatch/runs/:runId/manifest-discrepancies/approve", requireAuth, requireRole("super_admin", "dispatch_manager"), async (req: any, res: any) => {
+    const { runId } = req.params;
+    const { overrideId, resolutionNote } = req.body || {};
+
+    if (!overrideId) {
+      return res.status(400).json({ success: false, error: { code: "INVALID_ARGUMENT", message: "overrideId is required" } });
+    }
+
+    try {
+      const overrideRef = db.collection("manifestDiscrepancyOverrides").doc(overrideId);
+      const overrideDoc = await overrideRef.get();
+      if (!overrideDoc.exists || overrideDoc.data()?.runId !== runId) {
+        return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: `Manifest discrepancy override ${overrideId} not found for run ${runId}` } });
       }
 
       const nowStr = new Date().toISOString();
-      await runRef.update({
-        status: "accepted_by_rider",
-        acceptedByRider: true,
-        startTimestamp: nowStr,
-        acceptedAt: nowStr,
-        discrepancyOverrideReason: discrepancyOverrideReason || null,
+      await overrideRef.update({
+        status: "approved",
+        resolutionNote: resolutionNote?.trim() || null,
+        approvedAt: nowStr,
+        approvedByUid: req.auth.uid,
         updatedAt: nowStr
       });
-
-      // Atomically update all accepted packages to OUT_FOR_DELIVERY
-      const batch = db.batch();
-      for (const pid of expected) {
-        const pRef = db.collection("packages").doc(pid);
-        batch.update(pRef, {
-          current_status: "Out for Delivery",
-          operationalStatus: "out_for_delivery",
-          custodyStage: "rider_accepted",
-          custody_stage: "rider_accepted",
-          dispatchedAt: nowStr,
-          updatedAt: nowStr
-        });
-      }
-      await batch.commit();
-
-      const updatedSnap = await runRef.get();
-      return res.json({ success: true, data: updatedSnap.data() });
+      const updated = (await overrideRef.get()).data();
+      return res.json({ success: true, data: updated });
     } catch (err: any) {
-      return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: err.message } });
+      return res.status(500).json({ success: false, error: { code: err.code || "SERVER_ERROR", message: err.message } });
     }
   });
 
@@ -2107,7 +2327,9 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         .get();
       const validSettlements = settlementsSnap.docs.map(d => d.data()).filter((s: any) => s.status !== "rejected");
       const totalSubmitted = validSettlements.reduce((sum, s: any) => {
-        const amt = s.physicallyReceivedAmount > 0 ? s.physicallyReceivedAmount : (s.declaredCashAmount || 0);
+        const amt = ["cashier_received", "manager_approved", "closed"].includes(String(s.status || "").toLowerCase())
+          ? Number(s.physicallyReceivedAmount || 0)
+          : 0;
         return sum + Number(amt);
       }, 0);
 
@@ -2138,6 +2360,18 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         completedByUid: req.auth.uid,
         updatedAt: nowStr
       });
+
+      const packageReleaseBatch = db.batch();
+      for (const p of runPackages) {
+        const pRef = db.collection("packages").doc(p.id);
+        packageReleaseBatch.update(pRef, {
+          activeDispatchRunId: null,
+          activeDispatchRunNumber: null,
+          activeDispatchRunLockedAt: null,
+          updatedAt: nowStr
+        });
+      }
+      await packageReleaseBatch.commit();
 
       const finalSnap = await runRef.get();
       return res.json({
@@ -2282,6 +2516,81 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
   });
 
   // --- DELIVERY ATTEMPTS & OUTCOMES ---
+  app.post("/api/delivery/contact-events", requireAuth, requireExactRole("rider"), requirePackageOwnership, async (req: any, res: any) => {
+    const { packageId, method, outcome, notes } = req.body || {};
+    const normalizedMethod = String(method || "").toUpperCase();
+    const normalizedOutcome = String(outcome || "").toUpperCase();
+    const validMethods = ["CALL", "WHATSAPP"];
+    const validOutcomes = ["ANSWERED", "NO_ANSWER", "PHONE_OFF", "INVALID_NUMBER", "CALLBACK_REQUESTED"];
+
+    if (!packageId || !validMethods.includes(normalizedMethod) || !validOutcomes.includes(normalizedOutcome)) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "INVALID_CONTACT_EVENT", message: "packageId, method (CALL/WHATSAPP), and a valid outcome are required." }
+      });
+    }
+
+    try {
+      const eventId = `dce_${packageId}_${Date.now()}`;
+      const nowStr = new Date().toISOString();
+      const eventDoc = {
+        id: eventId,
+        packageId,
+        riderId: req.auth.riderId,
+        method: normalizedMethod,
+        outcome: normalizedOutcome,
+        notes: notes?.trim() || null,
+        timestamp: nowStr,
+        createdAt: nowStr
+      };
+      await db.collection("deliveryContactEvents").doc(eventId).set(eventDoc);
+      return res.json({ success: true, data: eventDoc });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: { code: err.code || "SERVER_ERROR", message: err.message } });
+    }
+  });
+
+  app.post("/api/delivery/gps-exceptions", requireAuth, requireRole("super_admin", "dispatch_manager"), async (req: any, res: any) => {
+    const { packageId, reason, expiresAt } = req.body || {};
+    if (!packageId || !reason || !String(reason).trim()) {
+      return res.status(400).json({ success: false, error: { code: "INVALID_ARGUMENT", message: "packageId and reason are required" } });
+    }
+
+    try {
+      const pkgRef = db.collection("packages").doc(packageId);
+      const pkgDoc = await pkgRef.get();
+      if (!pkgDoc.exists) {
+        return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: `Package ${packageId} not found` } });
+      }
+
+      const exceptionId = `gps_${packageId}_${Date.now()}`;
+      const nowStr = new Date().toISOString();
+      const exceptionDoc = {
+        id: exceptionId,
+        packageId,
+        reason: String(reason).trim(),
+        approvedByUid: req.auth.uid,
+        approvedAt: nowStr,
+        expiresAt: expiresAt || null,
+        status: "approved"
+      };
+      await db.collection("deliveryGpsExceptions").doc(exceptionId).set(exceptionDoc);
+      await pkgRef.set({
+        gpsExceptionApproved: true,
+        gpsExceptionId: exceptionId,
+        gpsExceptionApprovedByUid: req.auth.uid,
+        gpsExceptionApprovedAt: nowStr,
+        gpsExceptionReason: String(reason).trim(),
+        gpsExceptionExpiresAt: expiresAt || null,
+        updatedAt: nowStr
+      }, { merge: true });
+
+      return res.json({ success: true, data: exceptionDoc });
+    } catch (err: any) {
+      return res.status(500).json({ success: false, error: { code: err.code || "SERVER_ERROR", message: err.message } });
+    }
+  });
+
   app.post("/api/delivery/attempt", requireAuth, requireExactRole("rider"), requirePackageOwnership, async (req: any, res: any) => {
     const {
       packageId,
@@ -2331,9 +2640,17 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
     }
 
     // 2. Client-side Proof & Input Validations before starting transaction
-    const hasLat = latitude !== undefined && latitude !== null && latitude !== "" && !isNaN(Number(latitude));
-    const hasLng = longitude !== undefined && longitude !== null && longitude !== "" && !isNaN(Number(longitude));
-    const photoRef = (proofImageUrl || proofPhoto || proofImage || proofStoragePath || "").trim();
+    const hasLat = isValidCoordinate(latitude, -90, 90);
+    const hasLng = isValidCoordinate(longitude, -180, 180);
+    const legacyProofPayload = [proofImageUrl, proofPhoto, proofImage].find((value) => typeof value === "string" && value.trim()) as string | undefined;
+    const storageProofPath = typeof proofStoragePath === "string" ? proofStoragePath.trim() : "";
+
+    if (legacyProofPayload && isDataUrl(legacyProofPayload)) {
+      return res.status(400).json({
+        success: false,
+        error: { code: "BASE64_PROOF_REJECTED", message: "Photo proof must be uploaded to Firebase Storage first; base64 payloads are rejected." }
+      });
+    }
 
     if (rawOutcome === "DELIVERED") {
       if (collectedAmount === undefined || collectedAmount === null || collectedAmount === "" || isNaN(Number(collectedAmount))) {
@@ -2358,18 +2675,10 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
       }
 
       // Photo proof requirement
-      if (!photoRef) {
+      if (!storageProofPath) {
         return res.status(400).json({
           success: false,
-          error: { code: "PROOF_PHOTO_REQUIRED", message: "Delivered status requires photo proof." }
-        });
-      }
-
-      // GPS requirement (do not default missing GPS)
-      if (!hasLat || !hasLng) {
-        return res.status(400).json({
-          success: false,
-          error: { code: "GPS_COORDINATES_REQUIRED", message: "Delivered status requires valid GPS coordinates (latitude, longitude)." }
+          error: { code: "PROOF_STORAGE_PATH_REQUIRED", message: "Delivered status requires a Firebase Storage proof path." }
         });
       }
     } else if (rawOutcome === "RESCHEDULED") {
@@ -2390,7 +2699,6 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
 
     const effectiveAttemptId = customAttemptId || deliveryAttemptId || `att_${crypto.randomUUID()}`;
     const effectiveIdemKey = idempotencyKey || `DELIVERY:${packageId}:${effectiveAttemptId}`;
-    const isContacted = customerContacted === true;
     const nowStr = new Date().toISOString();
 
     try {
@@ -2430,6 +2738,11 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
           throw { status: 400, code: "INVALID_STATE_TRANSITION", message: `Cannot record delivery attempt for package in state "${currOpStatus}". Package must be OUT_FOR_DELIVERY.` };
         }
 
+        const gpsExceptionApproved = Boolean(pkgData?.gpsExceptionApproved);
+        if (rawOutcome === "DELIVERED" && (!hasLat || !hasLng) && !gpsExceptionApproved) {
+          throw { status: 400, code: "GPS_COORDINATES_REQUIRED", message: "Delivered status requires valid GPS coordinates unless a privileged GPS exception has already been approved." };
+        }
+
         // Determine Payment & COD amounts
         const isPrepaid = (pkgData.paymentMethod || pkgData.payment_method || "").toLowerCase() === "prepaid" ||
                           Number(pkgData.expectedCod || pkgData.cod_expected || 0) === 0;
@@ -2441,6 +2754,29 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         if (rawOutcome === "DELIVERED" && isDigital && (!digitalReference || !digitalReference.trim())) {
           throw { status: 400, code: "DIGITAL_REFERENCE_REQUIRED", message: "Digital payment method requires a digital reference." };
         }
+
+        let normalizedDigitalReference: string | null = null;
+        if (rawOutcome === "DELIVERED" && isDigital) {
+          normalizedDigitalReference = normalizeDigitalReference(digitalReference);
+          if (!normalizedDigitalReference) {
+            throw { status: 400, code: "DIGITAL_REFERENCE_REQUIRED", message: "Digital payment reference cannot be blank." };
+          }
+          const digRef = db.collection("digitalPaymentVerifications").doc(`dig_${normalizedDigitalReference}`);
+          const digDoc = await t.get(digRef);
+          if (digDoc.exists) {
+            const digData = digDoc.data();
+            if (digData?.packageId !== packageId) {
+              throw { status: 409, code: "DIGITAL_REFERENCE_ALREADY_USED", message: `Digital reference "${normalizedDigitalReference}" has already been used for another package.` };
+            }
+          }
+        }
+
+        const contactEventsQuery = db.collection("deliveryContactEvents")
+          .where("packageId", "==", packageId)
+          .where("riderId", "==", (req.auth.riderId || assignedRiderId))
+          .limit(1);
+        const contactEventsSnap = await t.get(contactEventsQuery);
+        const isContacted = !contactEventsSnap.empty;
 
         // Build Attempt Record
         const attemptRef = db.collection("deliveryAttempts").doc(effectiveAttemptId);
@@ -2455,8 +2791,8 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
           receiverRelationship: rawOutcome === "DELIVERED" ? (receiverRelationship?.trim() || "Recipient") : null,
           latitude: hasLat ? Number(latitude) : null,
           longitude: hasLng ? Number(longitude) : null,
-          proofImageUrl: photoRef || null,
-          proofStoragePath: proofStoragePath || null,
+          proofImageUrl: null,
+          proofStoragePath: storageProofPath || null,
           reason: reason || null,
           riderNotes: riderNotes || null,
           customerContacted: isContacted,
@@ -2555,7 +2891,7 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
               expectedCod,
               collectedAmount: collAmt,
               paymentMethod: normPayment,
-              digitalReference: isDigital ? digitalReference.trim() : null,
+              digitalReference: normalizedDigitalReference,
               collectionVariance,
               idempotencyKey: effectiveIdemKey,
               transactionId: txId,
@@ -2565,11 +2901,10 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
             t.set(codRef, codCollectionRecord);
 
             if (isDigital) {
-              const digRefClean = digitalReference.trim();
-              const digRef = db.collection("digitalPaymentVerifications").doc(`dig_${digRefClean}`);
+              const digRef = db.collection("digitalPaymentVerifications").doc(`dig_${normalizedDigitalReference}`);
               t.set(digRef, {
-                id: `dig_${digRefClean}`,
-                digitalReference: digRefClean,
+                id: `dig_${normalizedDigitalReference}`,
+                digitalReference: normalizedDigitalReference,
                 packageId,
                 paymentMethod: normPayment,
                 amount: collAmt,
@@ -2579,6 +2914,21 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
               });
             }
           }
+
+          const deliveryProofRef = db.collection("deliveryProofs").doc(`proof_${effectiveAttemptId}`);
+          t.set(deliveryProofRef, {
+            id: deliveryProofRef.id,
+            attemptId: effectiveAttemptId,
+            packageId,
+            riderId: req.auth.riderId || assignedRiderId,
+            proofStoragePath: storageProofPath,
+            latitude: hasLat ? Number(latitude) : null,
+            longitude: hasLng ? Number(longitude) : null,
+            capturedAt: deviceTimestamp || nowStr,
+            uploadedAt: nowStr,
+            receiverName: receiverName.trim(),
+            createdAt: nowStr
+          });
 
           // 4. Audit Event
           const auditRef = db.collection("auditLogs").doc(`audit_${crypto.randomUUID()}`);
@@ -2781,62 +3131,87 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
 
       const riderId = req.auth.riderId;
       const targetSettlementId = reqSettlementId || `stl_${riderId}_${Date.now()}`;
+      const idemKey = (idempotencyKey || `settlement_submit_${targetSettlementId}`).trim();
+      const idemRef = db.collection("idempotencyKeys").doc(idemKey);
+      let responseData: any;
 
-      // Calculate rider's physical cash obligation from un-settled cash collections
-      const codSnap = await db.collection("codCollections")
-        .where("riderId", "==", riderId)
-        .where("paymentMethod", "==", "cash")
-        .get();
+      await db.runTransaction(async (transaction: any) => {
+        const existingIdem = await transaction.get(idemRef);
+        if (existingIdem.exists) {
+          const idemData = existingIdem.data();
+          responseData = idemData?.result || null;
+          return;
+        }
 
-      const allCollections = codSnap.docs.map(d => d.data());
-      
-      const settlementLinesSnap = await db.collection("settlementLines").get();
-      const usedPackageIds = new Set(settlementLinesSnap.docs.map(d => d.data().packageId));
+        const codQuery = db.collection("codCollections")
+          .where("riderId", "==", riderId)
+          .where("paymentMethod", "==", "cash");
+        const codSnap = await transaction.get(codQuery);
+        const eligibleCollections = codSnap.docs
+          .map((d: any) => d.data())
+          .filter((c: any) => !c.settlementId && !c.assignedSettlementId);
 
-      const eligibleCollections = allCollections.filter((c: any) => !usedPackageIds.has(c.packageId));
-      const calculatedCashObligation = eligibleCollections.reduce((sum: number, c: any) => sum + (c.collectedAmount || 0), 0);
-      const riderHandoverVariance = Number(declaredCashAmount) - calculatedCashObligation;
+        const calculatedCashObligation = eligibleCollections.reduce((sum: number, c: any) => sum + Number(c.collectedAmount || 0), 0);
+        const riderHandoverVariance = Number(declaredCashAmount) - calculatedCashObligation;
+        const nowStr = new Date().toISOString();
+        const settlementDoc = {
+          id: targetSettlementId,
+          settlementNumber: `SET-${Date.now().toString().slice(-6)}`,
+          riderId,
+          status: "rider_submitted",
+          calculatedCashObligation,
+          declaredCashAmount: Number(declaredCashAmount),
+          physicallyReceivedAmount: 0,
+          collectionVariance: eligibleCollections.reduce((sum: number, c: any) => sum + Number(c.collectionVariance || 0), 0),
+          riderHandoverVariance,
+          cashierVariance: 0,
+          totalSettlementVariance: 0,
+          discrepancyType: "NONE",
+          discrepancyAmount: 0,
+          discrepancyReason: null,
+          notes: notes || null,
+          receiptNotes: null,
+          submittedAt: nowStr,
+          receivedAt: null,
+          approvedAt: null,
+          approvedByUid: null,
+          closedAt: null,
+          idempotencyKey: idemKey,
+          createdAt: nowStr,
+          updatedAt: nowStr
+        };
 
-      const nowStr = new Date().toISOString();
-      const settlementDoc = {
-        id: targetSettlementId,
-        settlementNumber: `SET-${Date.now().toString().slice(-6)}`,
-        riderId,
-        status: "rider_submitted",
-        calculatedCashObligation,
-        declaredCashAmount: Number(declaredCashAmount),
-        physicallyReceivedAmount: 0,
-        collectionVariance: eligibleCollections.reduce((sum: number, c: any) => sum + (c.collectionVariance || 0), 0),
-        riderHandoverVariance,
-        cashierVariance: 0,
-        discrepancyAmount: 0,
-        discrepancyReason: null,
-        notes: notes || null,
-        receiptNotes: null,
-        submittedAt: nowStr,
-        receivedAt: null,
-        approvedAt: null,
-        approvedByUid: null,
-        closedAt: null,
-        createdAt: nowStr,
-        updatedAt: nowStr
-      };
+        transaction.set(db.collection("riderSettlements").doc(targetSettlementId), settlementDoc);
 
-      await db.collection("riderSettlements").doc(targetSettlementId).set(settlementDoc);
+        eligibleCollections.forEach((col: any) => {
+          const lineId = `line_${targetSettlementId}_${col.packageId}`;
+          transaction.set(db.collection("settlementLines").doc(lineId), {
+            id: lineId,
+            settlementId: targetSettlementId,
+            riderId,
+            packageId: col.packageId,
+            collectedAmount: col.collectedAmount,
+            paymentMethod: "cash",
+            createdAt: nowStr
+          });
+          transaction.update(db.collection("codCollections").doc(col.id), {
+            settlementId: targetSettlementId,
+            assignedSettlementId: targetSettlementId,
+            settlementAssignedAt: nowStr,
+            updatedAt: nowStr
+          });
+        });
 
-      for (const col of eligibleCollections) {
-        const lineId = `line_${targetSettlementId}_${col.packageId}`;
-        await db.collection("settlementLines").doc(lineId).set({
-          id: lineId,
-          settlementId: targetSettlementId,
-          packageId: col.packageId,
-          collectedAmount: col.collectedAmount,
-          paymentMethod: "cash",
+        responseData = settlementDoc;
+        transaction.set(idemRef, {
+          key: idemKey,
+          action: "RIDER_SETTLEMENT_SUBMIT",
+          result: settlementDoc,
           createdAt: nowStr
         });
-      }
+      });
 
-      return res.json({ success: true, data: settlementDoc });
+      return res.json({ success: true, data: responseData });
     } catch (err: any) {
       return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: err.message } });
     }
@@ -2929,53 +3304,106 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
   // Manager Approve Discrepancy
   app.post("/api/finance/settlements/approve-discrepancy", requireAuth, requireRole("super_admin", "dispatch_manager"), async (req: any, res: any) => {
     try {
-      const { settlementId, discrepancyReason, idempotencyKey } = req.body;
-      if (!settlementId || !discrepancyReason || !discrepancyReason.trim()) {
-        return res.status(400).json({ success: false, error: { code: "DISCREPANCY_REASON_REQUIRED", message: "Approval requires a discrepancy reason" } });
+      const { settlementId, discrepancyReason, idempotencyKey, resolutionType, resolutionReason } = req.body;
+      if (!settlementId || !resolutionType || !String(resolutionType).trim()) {
+        return res.status(400).json({ success: false, error: { code: "RESOLUTION_TYPE_REQUIRED", message: "A privileged discrepancy resolution type is required." } });
       }
-
+      const normalizedResolutionType = String(resolutionType).trim().toUpperCase();
       const stlRef = db.collection("riderSettlements").doc(settlementId);
-      const stlDoc = await stlRef.get();
-      if (!stlDoc.exists) {
-        return res.status(404).json({ success: false, error: { code: "NOT_FOUND", message: `Settlement ${settlementId} not found` } });
-      }
+      const idemKey = (idempotencyKey || `settlement_resolution_${settlementId}_${normalizedResolutionType}`).trim();
+      const idemRef = db.collection("idempotencyKeys").doc(idemKey);
 
-      const stlData = stlDoc.data();
-      if (stlData?.status === "closed") {
-        return res.status(400).json({ success: false, error: { code: "SETTLEMENT_CLOSED", message: "Closed settlement cannot be modified." } });
-      }
-      if (stlData?.status === "manager_approved") {
-        return res.status(400).json({ success: false, error: { code: "DUPLICATE_APPROVAL_REJECTED", message: "Settlement discrepancy is already approved." } });
-      }
-
-      if (stlData.riderId === req.auth.riderId || stlData.riderId === req.auth.uid) {
-        return res.status(403).json({ success: false, error: { code: "SELF_APPROVAL_REJECTED", message: "Self-approval of discrepancy rejected." } });
-      }
-
-      const nowStr = new Date().toISOString();
-      await stlRef.update({
-        status: "manager_approved",
-        discrepancyReason: discrepancyReason.trim(),
-        approvedByUid: req.auth.uid,
-        approvedAt: nowStr,
-        updatedAt: nowStr
+      const resolutionResult = await createDoubleEntryTransaction(db, {
+        transactionType: "SETTLEMENT_DISCREPANCY_RESOLUTION",
+        sourceType: "rider_settlement",
+        sourceId: settlementId,
+        settlementId,
+        idempotencyKey: `ledger_${idemKey}`,
+        createdByUid: req.auth.uid,
+        postings: await (async () => {
+          const stlDoc = await stlRef.get();
+          if (!stlDoc.exists) {
+            throw { status: 404, code: "NOT_FOUND", message: `Settlement ${settlementId} not found` };
+          }
+          return buildSettlementResolutionPostings(stlDoc.data(), normalizedResolutionType);
+        })()
       });
 
-      const auditRef = db.collection("financialAuditEvents").doc();
-      await auditRef.set({
-        id: auditRef.id,
-        eventType: "SETTLEMENT_DISCREPANCY_APPROVED",
-        entityType: "rider_settlement",
-        entityId: settlementId,
-        actorUid: req.auth.uid,
-        details: { discrepancyReason: discrepancyReason.trim() },
-        createdAt: nowStr
+      let updatedDoc: any;
+      await db.runTransaction(async (transaction: any) => {
+        const existingIdem = await transaction.get(idemRef);
+        if (existingIdem.exists) {
+          updatedDoc = existingIdem.data()?.result || null;
+          return;
+        }
+
+        const stlDoc = await transaction.get(stlRef);
+        if (!stlDoc.exists) {
+          throw { status: 404, code: "NOT_FOUND", message: `Settlement ${settlementId} not found` };
+        }
+        const stlData = stlDoc.data();
+        if (stlData?.status === "closed") {
+          throw { status: 400, code: "SETTLEMENT_CLOSED", message: "Closed settlement cannot be modified." };
+        }
+        if (stlData?.status === "manager_approved") {
+          updatedDoc = stlData;
+          return;
+        }
+        if (stlData.riderId === req.auth.riderId || stlData.riderId === req.auth.uid) {
+          throw { status: 403, code: "SELF_APPROVAL_REJECTED", message: "Self-approval of discrepancy rejected." };
+        }
+
+        const nowStr = new Date().toISOString();
+        const effectiveReason = String(resolutionReason || discrepancyReason || "").trim();
+        if (!effectiveReason) {
+          throw { status: 400, code: "RESOLUTION_REASON_REQUIRED", message: "Resolution requires an explicit reason." };
+        }
+
+        const nextDoc = {
+          ...stlData,
+          status: "manager_approved",
+          discrepancyReason: String(discrepancyReason || stlData.discrepancyReason || "").trim() || null,
+          resolutionType: normalizedResolutionType,
+          resolutionReason: effectiveReason,
+          resolutionApprovedBy: req.auth.uid,
+          resolutionApprovedAt: nowStr,
+          approvedByUid: req.auth.uid,
+          approvedAt: nowStr,
+          resolutionTransactionId: resolutionResult.transactionId,
+          updatedAt: nowStr
+        };
+
+        transaction.set(stlRef, nextDoc, { merge: true });
+
+        const auditRef = db.collection("financialAuditEvents").doc();
+        transaction.set(auditRef, {
+          id: auditRef.id,
+          eventType: "SETTLEMENT_DISCREPANCY_APPROVED",
+          entityType: "rider_settlement",
+          entityId: settlementId,
+          actorUid: req.auth.uid,
+          details: {
+            discrepancyReason: nextDoc.discrepancyReason,
+            resolutionType: normalizedResolutionType,
+            resolutionReason: effectiveReason,
+            resolutionTransactionId: resolutionResult.transactionId
+          },
+          createdAt: nowStr
+        });
+
+        updatedDoc = nextDoc;
+        transaction.set(idemRef, {
+          key: idemKey,
+          action: "SETTLEMENT_DISCREPANCY_APPROVAL",
+          result: nextDoc,
+          createdAt: nowStr
+        });
       });
 
-      const updatedDoc = (await stlRef.get()).data();
       return res.json({ success: true, data: updatedDoc });
     } catch (err: any) {
-      return res.status(500).json({ success: false, error: { code: "SERVER_ERROR", message: err.message } });
+      const status = err.status || 500;
+      return res.status(status).json({ success: false, error: { code: err.code || "SERVER_ERROR", message: err.message } });
     }
   });
 
@@ -3175,38 +3603,98 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
   // --- ANALYTICS ---
   app.get("/api/analytics/summary", requireAuth, requireAnyRole("super_admin", "dispatch_manager", "management_viewer"), async (req: any, res: any) => {
     try {
-      const snap = await db.collection("packages").get();
-      const orders = snap.docs.map(d => d.data());
+      const [{ startIso, endIso }, packageSnap, assignmentSnap, attemptSnap, returnSnap, codSnap, postingSnap, settlementSnap] = await Promise.all([
+        Promise.resolve(getAsiaKarachiDayRange()),
+        db.collection("packages").get(),
+        db.collection("assignments").get(),
+        db.collection("deliveryAttempts").get(),
+        db.collection("returns").get(),
+        db.collection("codCollections").get(),
+        db.collection("financialPostings").get(),
+        db.collection("riderSettlements").get()
+      ]);
+
+      const orders = packageSnap.docs.map((d: any) => d.data());
+      const assignments = assignmentSnap.docs.map((d: any) => d.data());
+      const attempts = attemptSnap.docs.map((d: any) => d.data());
+      const returns = returnSnap.docs.map((d: any) => d.data());
+      const codCollections = codSnap.docs.map((d: any) => d.data());
+      const postings = postingSnap.docs.map((d: any) => d.data());
+      const settlements = settlementSnap.docs.map((d: any) => d.data());
 
       const totalOrders = orders.length;
-      const delivered = orders.filter((o: any) => o.current_status === "delivered" || o.operationalStatus === "delivered");
-      const returned = orders.filter((o: any) => o.current_status === "returned" || o.operationalStatus === "returned");
-      const awaiting = orders.filter((o: any) => o.current_status === "imported_review" || o.operationalStatus === "imported_review");
-      const inTransit = orders.filter((o: any) => o.current_status === "dispatched" || o.operationalStatus === "dispatched");
+      const deliveredPackages = orders.filter((o: any) => String(o.current_status || o.operationalStatus || "").toLowerCase() === "delivered");
+      const returnedPackages = orders.filter((o: any) => String(o.current_status || o.operationalStatus || "").toLowerCase() === "returned");
+      const awaiting = orders.filter((o: any) => String(o.current_status || o.operationalStatus || "").toLowerCase() === "imported_review");
+      const inTransit = orders.filter((o: any) => ["dispatched", "out_for_delivery"].includes(String(o.current_status || o.operationalStatus || "").toLowerCase()));
 
-      const totalExpectedCod = orders.reduce((acc: number, o: any) => acc + (o.cod_expected || o.expectedCod || 0), 0);
-      const totalCollectedCod = delivered.reduce((acc: number, o: any) => acc + (o.collectedAmount || o.cod_expected || o.expectedCod || 0), 0);
+      const assignmentsToday = assignments.filter((a: any) => isIsoWithinRange(a.assignedAt, startIso, endIso));
+      const deliveredTodayAttempts = attempts.filter((a: any) => a.status === "DELIVERED" && isIsoWithinRange(a.createdAt || a.serverTimestamp, startIso, endIso));
+      const failedTodayAttempts = attempts.filter((a: any) => a.status !== "DELIVERED" && isIsoWithinRange(a.createdAt || a.serverTimestamp, startIso, endIso));
+      const returnedToday = returns.filter((r: any) => isIsoWithinRange(r.updatedAt || r.createdAt, startIso, endIso));
+      const codCollectionsToday = codCollections.filter((c: any) => isIsoWithinRange(c.createdAt, startIso, endIso));
+      const cashierReceivedToday = settlements.filter((s: any) => isIsoWithinRange(s.receivedAt, startIso, endIso));
+
+      const firstAttemptDeliveredPackages = deliveredTodayAttempts.filter((attempt: any) => {
+        const priorAttempts = attempts.filter((candidate: any) => candidate.packageId === attempt.packageId);
+        return priorAttempts.length === 1;
+      });
+      const firstAttemptPercentage = deliveredTodayAttempts.length > 0
+        ? `${((firstAttemptDeliveredPackages.length / deliveredTodayAttempts.length) * 100).toFixed(1)}%`
+        : "0%";
+
+      const riderDebits = postings.filter((p: any) => p.accountCode === "RIDER_CASH_WALLET").reduce((sum: number, p: any) => sum + Number(p.debitAmount || 0), 0);
+      const riderCredits = postings.filter((p: any) => p.accountCode === "RIDER_CASH_WALLET").reduce((sum: number, p: any) => sum + Number(p.creditAmount || 0), 0);
+      const cashierDebitsToday = postings
+        .filter((p: any) => p.accountCode === "CASHIER_CASH_CONTROL" && isIsoWithinRange(p.createdAt, startIso, endIso))
+        .reduce((sum: number, p: any) => sum + Number(p.debitAmount || 0), 0);
+
+      const openDiscrepancies = settlements.filter((s: any) => s.status === "discrepancy");
+      const openShortage = openDiscrepancies
+        .filter((s: any) => Number(s.totalSettlementVariance || 0) < 0)
+        .reduce((sum: number, s: any) => sum + Math.abs(Number(s.totalSettlementVariance || 0)), 0);
+      const openExcess = openDiscrepancies
+        .filter((s: any) => Number(s.totalSettlementVariance || 0) > 0)
+        .reduce((sum: number, s: any) => sum + Number(s.totalSettlementVariance || 0), 0);
+      const unsettledCod = codCollections
+        .filter((c: any) => !c.settlementId && !c.assignedSettlementId)
+        .reduce((sum: number, c: any) => sum + Number(c.collectedAmount || 0), 0);
+
+      const totalExpectedCod = deliveredTodayAttempts.reduce((acc: number, attempt: any) => {
+        const pkg = orders.find((order: any) => order.id === attempt.packageId);
+        return acc + Number(pkg?.cod_expected || pkg?.expectedCod || pkg?.codExpected || 0);
+      }, 0);
+      const totalCollectedCod = codCollectionsToday.reduce((acc: number, c: any) => acc + Number(c.collectedAmount || 0), 0);
+      const totalSettledCod = cashierReceivedToday.reduce((acc: number, s: any) => acc + Number(s.physicallyReceivedAmount || 0), 0);
 
       return res.json({
         success: true,
         data: {
           totalOrders,
-          importedToday: awaiting.length,
+          importedToday: orders.filter((o: any) => isIsoWithinRange(o.createdAt, startIso, endIso)).length,
           awaitingAssignment: awaiting.length,
           handedToRiders: inTransit.length,
           outForDelivery: inTransit.length,
-          deliveredToday: delivered.length,
-          totalDelivered: delivered.length,
-          totalReturned: returned.length,
-          totalRescheduled: 0,
-          successPercentage: totalOrders > 0 ? `${((delivered.length / totalOrders) * 100).toFixed(1)}%` : "0%",
-          firstAttemptPercentage: "100%",
+          deliveredToday: deliveredTodayAttempts.length,
+          totalDelivered: deliveredPackages.length,
+          totalReturned: returnedPackages.length,
+          totalRescheduled: failedTodayAttempts.filter((a: any) => a.status === "RESCHEDULED").length,
+          successPercentage: totalOrders > 0 ? `${((deliveredPackages.length / totalOrders) * 100).toFixed(1)}%` : "0%",
+          firstAttemptPercentage,
           totalExpectedCod,
           totalCollectedCod,
-          totalSettledCod: 0,
-          codHeldByRiders: inTransit.reduce((acc: number, o: any) => acc + (o.cod_expected || o.expectedCod || 0), 0),
-          codDiscrepancies: 0,
-          aging: { pending24: 0, pending48: 0, pending72: 0 }
+          totalSettledCod,
+          codHeldByRiders: Math.max(0, riderDebits - riderCredits),
+          codDiscrepancies: openShortage + openExcess,
+          aging: { pending24: 0, pending48: 0, pending72: 0 },
+          assignedToday: assignmentsToday.length,
+          failedToday: failedTodayAttempts.length,
+          returnedToday: returnedToday.length,
+          cashierReceived: cashierDebitsToday,
+          openShortage,
+          openExcess,
+          unsettledCod,
+          reportingDay: getAsiaKarachiDayRange().dayString
         }
       });
     } catch (err: any) {

@@ -16,6 +16,8 @@ import {
 } from 'lucide-react';
 import { Order, Package } from '../../types';
 import { api } from '../../services/api';
+import { storage, auth } from '../../lib/firebase';
+import { ref, uploadBytes } from 'firebase/storage';
 
 type DeliveryOutcomeType = 
   | 'DELIVERED'
@@ -50,6 +52,7 @@ export function RiderDeliveryAttemptModal({
   const [paymentMethod, setPaymentMethod] = useState<'Cash' | 'Prepaid' | 'JazzCash' | 'EasyPaisa'>(isPrepaid ? 'Prepaid' : 'Cash');
   const [digitalReference, setDigitalReference] = useState('');
   const [proofImage, setProofImage] = useState<string | null>(null);
+  const [proofFile, setProofFile] = useState<File | null>(null);
   
   // Failure / Reschedule fields
   const [quickReason, setQuickReason] = useState<string>('');
@@ -80,21 +83,21 @@ export function RiderDeliveryAttemptModal({
         },
         (err) => {
           console.warn('GPS capture warning:', err);
-          // Fallback to default operational coordinates if browser blocks iframe GPS
-          setGpsCoords({ lat: 31.5204, lng: 74.3587 });
-          setGpsStatus('acquired');
+          setGpsCoords({});
+          setGpsStatus('error');
         },
         { timeout: 5000 }
       );
     } else {
-      setGpsCoords({ lat: 31.5204, lng: 74.3587 });
-      setGpsStatus('acquired');
+      setGpsCoords({});
+      setGpsStatus('error');
     }
   };
 
   const handleImageCapture = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
+      setProofFile(file);
       const reader = new FileReader();
       reader.onload = () => {
         setProofImage(reader.result as string);
@@ -165,6 +168,20 @@ export function RiderDeliveryAttemptModal({
     const effectiveReason = quickReason ? (additionalNotes.trim() ? `${quickReason} - ${additionalNotes.trim()}` : quickReason) : additionalNotes.trim();
 
     try {
+      let proofStoragePath: string | undefined;
+      if (selectedOutcome === 'DELIVERED' && proofFile) {
+        const riderUid = auth.currentUser?.uid;
+        if (!riderUid) {
+          throw new Error('Authentication session missing for proof upload.');
+        }
+        const fileName = `${Date.now()}_${proofFile.name.replace(/[^a-zA-Z0-9._-]/g, '_')}`;
+        proofStoragePath = `deliveryProofs/${riderUid}/${attemptId}/${fileName}`;
+        const storageRef = ref(storage, proofStoragePath);
+        await uploadBytes(storageRef, proofFile, {
+          contentType: proofFile.type || 'image/jpeg'
+        });
+      }
+
       const payload: any = {
         packageId: order.id,
         status: selectedOutcome,
@@ -178,11 +195,9 @@ export function RiderDeliveryAttemptModal({
         reason: selectedOutcome !== 'DELIVERED' ? effectiveReason : undefined,
         riderNotes: additionalNotes.trim() || effectiveReason || undefined,
         newDeliveryDate: selectedOutcome === 'RESCHEDULED' ? `${rescheduleDate} (${timeSlot})` : undefined,
-        proof_image_url: selectedOutcome === 'DELIVERED' ? (proofImage || undefined) : undefined,
-        proofImageUrl: selectedOutcome === 'DELIVERED' ? (proofImage || undefined) : undefined,
-        latitude: gpsCoords.lat || 31.5204,
-        longitude: gpsCoords.lng || 74.3587,
-        customerContacted: true,
+        proofStoragePath: selectedOutcome === 'DELIVERED' ? proofStoragePath : undefined,
+        latitude: gpsCoords.lat ?? null,
+        longitude: gpsCoords.lng ?? null,
         deviceTimestamp: new Date().toISOString()
       };
 

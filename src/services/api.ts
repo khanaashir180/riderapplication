@@ -45,6 +45,14 @@ export interface AnalyticsSummary {
   totalSettledCod: number;
   codHeldByRiders: number;
   codDiscrepancies: number;
+  assignedToday?: number;
+  failedToday?: number;
+  returnedToday?: number;
+  cashierReceived?: number;
+  openShortage?: number;
+  openExcess?: number;
+  unsettledCod?: number;
+  reportingDay?: string;
   aging: {
     pending24: number;
     pending48: number;
@@ -321,6 +329,13 @@ export const api = {
     });
   },
 
+  async reportManifestDiscrepancy(runId: string, payload: { note?: string; expectedPackages?: string[]; scannedPackages?: string[] } = {}): Promise<ApiResponse<any>> {
+    return request<any>(`/api/dispatch/runs/${encodeURIComponent(runId)}/manifest-discrepancies/report`, {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
+
   async endDispatchRunShift(runId: string): Promise<ApiResponse<any>> {
     return request<any>(`/api/dispatch/runs/${encodeURIComponent(runId)}/end-shift`, {
       method: "POST",
@@ -353,10 +368,22 @@ export const api = {
     proofStatus?: string;
     reason?: string;
     riderNotes?: string;
-    customerContacted?: boolean;
     newDeliveryDate?: string;
+    proofStoragePath?: string;
   }): Promise<ApiResponse<any>> {
     return request<any>("/api/delivery/attempt", {
+      method: "POST",
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async recordDeliveryContactEvent(payload: {
+    packageId: string;
+    method: 'CALL' | 'WHATSAPP';
+    outcome: 'ANSWERED' | 'NO_ANSWER' | 'PHONE_OFF' | 'INVALID_NUMBER' | 'CALLBACK_REQUESTED';
+    notes?: string;
+  }): Promise<ApiResponse<any>> {
+    return request<any>("/api/delivery/contact-events", {
       method: "POST",
       body: JSON.stringify(payload)
     });
@@ -441,7 +468,7 @@ export const api = {
     });
   },
 
-  async approveSettlementDiscrepancy(payload: { settlementId: string; discrepancyReason: string; idempotencyKey?: string }): Promise<ApiResponse<any>> {
+  async approveSettlementDiscrepancy(payload: { settlementId: string; discrepancyReason?: string; resolutionType: 'RECOVERED_FROM_RIDER' | 'APPROVED_WRITE_OFF' | 'ACCOUNTING_CORRECTION' | 'SYSTEM_CORRECTION'; resolutionReason: string; idempotencyKey?: string }): Promise<ApiResponse<any>> {
     return request<any>("/api/finance/settlements/approve-discrepancy", {
       method: "POST",
       body: JSON.stringify(payload)

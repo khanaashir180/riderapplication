@@ -431,6 +431,14 @@ export interface AnalyticsSummary {
   totalSettledCod: number;
   codHeldByRiders: number;
   codDiscrepancies: number;
+  assignedToday?: number;
+  failedToday?: number;
+  returnedToday?: number;
+  cashierReceived?: number;
+  openShortage?: number;
+  openExcess?: number;
+  unsettledCod?: number;
+  reportingDay?: string;
   aging: {
     pending24: number;
     pending48: number;

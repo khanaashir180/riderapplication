@@ -18,6 +18,18 @@ export interface ShopifyRouterOptions {
 export function createShopifyRouter({ db, requireAuth, requireAnyRole }: ShopifyRouterOptions): Router {
   const router = Router();
 
+  function timingSafeSecretMatch(actualHeader: unknown, configuredSecret: string) {
+    if (typeof actualHeader !== "string") return false;
+    const presented = actualHeader.trim();
+    if (!presented || !configuredSecret) return false;
+    const presentedBuffer = Buffer.from(presented);
+    const configuredBuffer = Buffer.from(configuredSecret);
+    if (presentedBuffer.length !== configuredBuffer.length) {
+      return false;
+    }
+    return crypto.timingSafeEqual(presentedBuffer, configuredBuffer);
+  }
+
   function getShopifyConfig() {
     const rawDomain = (process.env.SHOPIFY_STORE_DOMAIN || "").trim();
     const cleanDomain = rawDomain
@@ -657,19 +669,25 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
   // 5. POST /api/shopify/order - Direct webhook / single order ingestion (SECURE)
   router.post("/order", async (req: any, res: any) => {
     try {
-      // Release Gate 15: Ingestion Security Verification
       const secretHeader = req.headers["x-gomila-integration-secret"] || req.headers["x-integration-secret"] || req.headers["x-shopify-hmac-sha256"];
-      const configuredSecret = (process.env.SHOPIFY_INTEGRATION_SECRET || "gomila_secret_make_webhook_2025").trim();
-      const authHeader = req.headers.authorization;
-      const isSecretValid = secretHeader && (secretHeader === configuredSecret || secretHeader.toString().length >= 16);
-      const isBearerValid = authHeader && authHeader.startsWith("Bearer ") && req.auth;
+      const configuredSecret = (process.env.SHOPIFY_INTEGRATION_SECRET || "").trim();
 
-      if (!isSecretValid && !isBearerValid) {
+      if (!configuredSecret) {
+        return res.status(503).json({
+          success: false,
+          error: {
+            code: "SHOPIFY_SECRET_NOT_CONFIGURED",
+            message: "SHOPIFY_INTEGRATION_SECRET is not configured. Shopify ingestion is disabled."
+          }
+        });
+      }
+
+      if (!timingSafeSecretMatch(secretHeader, configuredSecret)) {
         return res.status(401).json({
           success: false,
           error: {
             code: "UNAUTHORIZED_INTEGRATION_REQUEST",
-            message: "Missing or invalid integration secret key or authorization header. Webhook rejected."
+            message: "Missing or invalid integration secret key. Webhook rejected."
           }
         });
       }

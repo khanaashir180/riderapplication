@@ -44,12 +44,12 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
 
   const handleOpenReconcileModal = (stl: RiderSettlement) => {
     setSelectedSettlement(stl);
-    const expected = stl.calculatedCashObligation ?? stl.expected_cod ?? 0;
-    const declared = stl.declaredCashAmount ?? stl.rider_reported_amount ?? expected;
-    const received = stl.physicallyReceivedAmount ?? stl.cashier_received_amount ?? expected;
+    const expected = stl.calculatedCashObligation ?? 0;
+    const declared = stl.declaredCashAmount ?? expected;
+    const received = stl.physicallyReceivedAmount ?? 0;
     setRiderReported(declared);
     setCashierReceived(received);
-    setDiscrepancyNotes(stl.discrepancyReason || stl.discrepancy_reason || '');
+    setDiscrepancyNotes(stl.discrepancyReason || '');
   };
 
   const handleReconcileSubmit = async (action: 'receive' | 'approve' | 'resolve_discrepancy') => {
@@ -66,7 +66,9 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
         if (res.data && res.data.status === 'discrepancy' && discrepancyNotes) {
           await api.approveSettlementDiscrepancy({
             settlementId: selectedSettlement.id,
-            discrepancyReason: discrepancyNotes
+            discrepancyReason: discrepancyNotes,
+            resolutionType: 'APPROVED_WRITE_OFF',
+            resolutionReason: discrepancyNotes
           });
           await api.closeSettlement({
             settlementId: selectedSettlement.id
@@ -92,7 +94,7 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
 
   // Filter settlements by discrepancy if on discrepancy tab
   const activeSettlementsList = activeSubTab === 'discrepancies' 
-    ? settlements.filter(s => (s.totalSettlementVariance !== undefined ? s.totalSettlementVariance !== 0 : s.difference_amount !== 0) || s.status === 'discrepancy' || s.settlement_status === 'Discrepancy')
+    ? settlements.filter(s => (s.totalSettlementVariance ?? 0) !== 0 || s.status === 'discrepancy')
     : settlements;
 
   return (
@@ -108,7 +110,7 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
           <div className="text-right">
             <span className="text-[10px] text-[#6D6964] uppercase block font-semibold">Expected Cash Today</span>
             <span className="font-mono font-bold text-sm text-[#5A2628]">
-              Rs. {settlements.reduce((sum, s) => sum + (s.calculatedCashObligation ?? s.expected_cod ?? 0), 0).toLocaleString()}
+              Rs. {settlements.reduce((sum, s) => sum + (s.calculatedCashObligation ?? 0), 0).toLocaleString()}
             </span>
           </div>
         </div>
@@ -141,10 +143,10 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
                   </tr>
                 ) : (
                   activeSettlementsList.map((stl) => {
-                    const expected = stl.calculatedCashObligation ?? stl.expected_cod ?? 0;
-                    const declared = stl.declaredCashAmount ?? stl.rider_reported_amount ?? 0;
-                    const received = stl.physicallyReceivedAmount ?? stl.cashier_received_amount ?? 0;
-                    const variance = stl.totalSettlementVariance !== undefined ? stl.totalSettlementVariance : (received || declared) - expected;
+                    const expected = stl.calculatedCashObligation ?? 0;
+                    const declared = stl.declaredCashAmount ?? 0;
+                    const received = stl.physicallyReceivedAmount ?? 0;
+                    const variance = stl.totalSettlementVariance ?? (received - expected);
                     const hasDiscrepancy = variance !== 0;
 
                     return (
@@ -171,11 +173,11 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
                         </td>
                         <td className="p-3">
                           <span className={`text-[10px] font-bold px-2 py-0.5 rounded border ${
-                            (stl.status === 'matched' || stl.status === 'resolved' || stl.status === 'manager_approved' || stl.settlement_status === 'Approved') ? 'bg-[#1F7A52]/10 text-[#1F7A52] border-[#1F7A52]/30' :
-                            (stl.status === 'discrepancy' || stl.settlement_status === 'Discrepancy') ? 'bg-[#B43B3B]/10 text-[#B43B3B] border-[#B43B3B]/30' :
+                            (stl.status === 'cashier_received' || stl.status === 'manager_approved' || stl.status === 'closed') ? 'bg-[#1F7A52]/10 text-[#1F7A52] border-[#1F7A52]/30' :
+                            (stl.status === 'discrepancy') ? 'bg-[#B43B3B]/10 text-[#B43B3B] border-[#B43B3B]/30' :
                             'bg-stone-100 text-[#6D6964] border-[#DDD9D4]'
                           }`}>
-                            {stl.status || stl.settlement_status}
+                            {stl.status}
                           </span>
                         </td>
                         <td className="p-3 text-[#6D6964] text-[11px]">
@@ -245,7 +247,7 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
               <div className="bg-[#F5F4F2] p-3 rounded-md border border-[#DDD9D4] space-y-1">
                 <span className="text-[10px] font-bold text-[#6D6964] uppercase block">Expected System COD</span>
                 <span className="font-mono text-base font-bold text-[#5A2628]">
-                  Rs. {selectedSettlement.expected_cod.toLocaleString()}
+                  Rs. {(selectedSettlement.calculatedCashObligation ?? 0).toLocaleString()}
                 </span>
               </div>
 
@@ -269,7 +271,7 @@ export function CODFinanceWorkspace({ activeSubTab }: CODFinanceWorkspaceProps) 
                 />
               </div>
 
-              {cashierReceived !== selectedSettlement.expected_cod && (
+              {cashierReceived !== (selectedSettlement.calculatedCashObligation ?? 0) && (
                 <div>
                   <label className="block font-semibold text-[#B43B3B] mb-1">Discrepancy Justification *</label>
                   <input

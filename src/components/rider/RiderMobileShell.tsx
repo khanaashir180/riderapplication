@@ -104,8 +104,17 @@ export function RiderMobileShell({ userProfile, onLogout }: RiderMobileShellProp
     }
   };
 
-  const handleLogContact = (orderId: string, channel: 'CALL' | 'WHATSAPP') => {
+  const handleLogContact = async (orderId: string, channel: 'CALL' | 'WHATSAPP') => {
     setContactedOrderIds((prev) => new Set([...prev, orderId]));
+    try {
+      await api.recordDeliveryContactEvent({
+        packageId: orderId,
+        method: channel,
+        outcome: channel === 'CALL' ? 'NO_ANSWER' : 'CALLBACK_REQUESTED'
+      });
+    } catch (error) {
+      console.warn('Failed to record contact event', error);
+    }
   };
 
   // Status Categorizations
