@@ -16,7 +16,8 @@ import {
   RefreshCw,
   Box,
   Repeat,
-  ShieldCheck
+  ShieldCheck,
+  ShoppingBag
 } from 'lucide-react';
 import { UserRole } from '../../types';
 
@@ -105,7 +106,8 @@ export function Sidebar({
         ];
       case 'admin':
         return [
-          { id: 'users', label: 'User Management', icon: <Users className="w-3.5 h-3.5" /> }
+          { id: 'users', label: 'User Management', icon: <Users className="w-3.5 h-3.5" /> },
+          { id: 'shopify', label: 'Shopify Integration', icon: <ShoppingBag className="w-3.5 h-3.5" /> }
         ];
       case 'rider':
         return [];

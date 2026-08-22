@@ -12,16 +12,13 @@ import {
   CheckCircle2, 
   Clock,
   RotateCw,
-  ShoppingBag
 } from 'lucide-react';
 import { Order, Rider } from '../../types';
 import { api } from '../../services/api';
 import { OrderDrawer } from './OrderDrawer';
 import { CSVImportDrawer } from './CSVImportDrawer';
-import { ShopifySyncModal } from './ShopifySyncModal';
 
 interface OrdersScreenProps {
-  userRole?: string;
   initialFilterStatus?: string;
   onSelectOrder: (id: string) => void;
   selectedOrderId: string | null;
@@ -29,7 +26,6 @@ interface OrdersScreenProps {
 }
 
 export function OrdersScreen({
-  userRole,
   initialFilterStatus,
   onSelectOrder,
   selectedOrderId,
@@ -67,7 +63,6 @@ export function OrdersScreen({
 
   // Drawer Triggers
   const [showImportDrawer, setShowImportDrawer] = useState(false);
-  const [showShopifySyncModal, setShowShopifySyncModal] = useState(false);
 
   useEffect(() => {
     loadOrdersData();
@@ -238,16 +233,6 @@ export function OrdersScreen({
             <span>Export CSV</span>
           </button>
 
-          {userRole === 'super_admin' && (
-            <button
-              onClick={() => setShowShopifySyncModal(true)}
-              title="Recovery only. Normal Shopify order flow is webhook-driven."
-              className="px-3 py-1.5 text-xs font-bold text-[#1F1F1D] bg-[#95BF47]/20 hover:bg-[#95BF47]/30 border border-[#95BF47]/60 rounded-lg shadow-2xs flex items-center space-x-1.5 transition cursor-pointer"
-            >
-              <ShoppingBag className="w-3.5 h-3.5 text-[#43682B]" />
-              <span>Shopify Recovery Sync</span>
-            </button>
-          )}
 
           {/* CSV Import Trigger Button */}
           <button
@@ -478,15 +463,6 @@ export function OrdersScreen({
           }}
         />
       )}
-
-      {/* Shopify Direct Sync Modal */}
-      <ShopifySyncModal
-        isOpen={showShopifySyncModal}
-        onClose={() => setShowShopifySyncModal(false)}
-        onSyncSuccess={() => {
-          loadOrdersData();
-        }}
-      />
 
     </div>
   );

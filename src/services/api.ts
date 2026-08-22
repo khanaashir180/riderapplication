@@ -654,6 +654,26 @@ export const api = {
     return request<{ configured: boolean; storeDomain: string | null; apiVersion: string; message?: string }>("/api/shopify/status");
   },
 
+  async getShopifyHealth(): Promise<ApiResponse<any>> {
+    return request<any>("/api/shopify/health");
+  },
+
+  async getShopifyWebhookSubscriptions(): Promise<ApiResponse<any>> {
+    return request<any>("/api/shopify/webhook-subscriptions");
+  },
+
+  async repairShopifyWebhookSubscriptions(): Promise<ApiResponse<any>> {
+    return request<any>("/api/shopify/webhook-subscriptions/repair", { method: "POST" });
+  },
+
+  async getShopifyDeadLetters(): Promise<ApiResponse<any[]>> {
+    return request<any[]>("/api/shopify/webhooks/dead-letter");
+  },
+
+  async replayShopifyWebhook(eventId: string): Promise<ApiResponse<any>> {
+    return request<any>(`/api/shopify/webhooks/${encodeURIComponent(eventId)}/replay`, { method: "POST" });
+  },
+
   async testShopifyConnection(): Promise<ApiResponse<{ shopName?: string; email?: string; currency?: string; domain?: string; country?: string }>> {
     return request<{ shopName?: string; email?: string; currency?: string; domain?: string; country?: string }>("/api/shopify/test-connection", {
       method: "POST"

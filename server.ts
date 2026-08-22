@@ -15,6 +15,7 @@ import { createLogisticsRouter } from "./src/server/logisticsRouter.js";
 import { createAdminUserRouter, AdminUserTestHooks } from "./src/server/adminUserRouter.js";
 import { createShopifyRouter } from "./src/server/shopifyRouter.js";
 import { createManagementRouter } from "./src/server/managementRouter.js";
+import { enqueueShopifyOutboundEvent } from "./src/services/shopifyOutbound.js";
 
 const PORT = 3000;
 
@@ -2446,6 +2447,18 @@ export function createApp(adminUserTestHooks?: AdminUserTestHooks) {
         body: req.body,
         verifyDeliveryProofStorageObject
       });
+      const packageId = String(req.body?.packageId || "");
+      const packageSnapshot = packageId ? await db.collection("packages").doc(packageId).get() : null;
+      const packageData = packageSnapshot?.exists ? packageSnapshot.data() : null;
+      if (packageData?.source === "shopify" && packageData.shopifyId) {
+        void enqueueShopifyOutboundEvent(db, {
+          packageId,
+          shopifyOrderId: String(packageData.shopifyId),
+          eventType: "DELIVERY_STATUS_CHANGED",
+          idempotencyKey: String(req.body?.idempotencyKey || req.body?.attemptId || `delivery_${packageId}_${result?.deliveryAttemptId || Date.now()}`),
+          payload: { status: result?.status || req.body?.status, riderId: req.auth.riderId, packageId, occurredAt: new Date().toISOString() }
+        }).catch((error) => console.error("Shopify outbound queue enqueue failed", error));
+      }
       return res.json({ success: true, data: result });
     } catch (err: any) {
       const status = err.status || 500;

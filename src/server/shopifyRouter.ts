@@ -8,6 +8,8 @@ import {
   classifyDeliveryChannel
 } from "../services/csvImporter";
 import { classifyCustodyChanges, hasRiderCustody, isOlderShopifyEvent, isSupportedShopifyTopic } from "../services/shopifyEventPolicy";
+import { applyShopifyCommerceUpdate, evaluateShopifyReadiness, normalizeShopifyPayment } from "../services/shopifyMapper";
+import { verifyGomilaIntegrationSecret, verifyShopifyWebhookHmac } from "../services/shopifySecurity";
 
 export interface ShopifyRouterOptions {
   db: any;
@@ -18,18 +20,6 @@ export interface ShopifyRouterOptions {
 
 export function createShopifyRouter({ db, requireAuth, requireAnyRole }: ShopifyRouterOptions): Router {
   const router = Router();
-
-  function timingSafeSecretMatch(actualHeader: unknown, configuredSecret: string) {
-    if (typeof actualHeader !== "string") return false;
-    const presented = actualHeader.trim();
-    if (!presented || !configuredSecret) return false;
-    const presentedBuffer = Buffer.from(presented);
-    const configuredBuffer = Buffer.from(configuredSecret);
-    if (presentedBuffer.length !== configuredBuffer.length) {
-      return false;
-    }
-    return crypto.timingSafeEqual(presentedBuffer, configuredBuffer);
-  }
 
   function getShopifyConfig() {
     const rawDomain = (process.env.SHOPIFY_STORE_DOMAIN || "").trim();
@@ -61,6 +51,36 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
           : "Shopify credentials not configured. Please set SHOPIFY_STORE_DOMAIN and SHOPIFY_ADMIN_ACCESS_TOKEN in environment variables."
       }
     });
+  });
+
+  router.get("/health", requireAuth, requireAnyRole("super_admin"), async (_req: any, res: any) => {
+    try { return res.json({ success: true, data: await getShopifyHealth() }); }
+    catch (err: any) { return res.status(500).json({ success: false, error: { code: "SHOPIFY_HEALTH_FAILED", message: err.message } }); }
+  });
+
+  router.get("/webhook-subscriptions", requireAuth, requireAnyRole("super_admin"), async (_req: any, res: any) => {
+    const config = getShopifyConfig();
+    if (!config.configured) return res.status(400).json({ success: false, error: { code: "SHOPIFY_NOT_CONFIGURED", message: "Shopify credentials are not configured." } });
+    try {
+      const result = await shopifyGraphQL(config, "query WebhookSubscriptions { webhookSubscriptions(first: 100) { nodes { id topic } } }");
+      const expectedTopics = ["ORDERS_CREATE", "ORDERS_UPDATED", "ORDERS_EDITED", "ORDERS_CANCELLED", "ORDERS_PAID", "REFUNDS_CREATE"];
+      const subscriptions = result.data?.webhookSubscriptions?.nodes || [];
+      return res.json({ success: true, data: { expectedTopics, subscriptions, missingTopics: expectedTopics.filter((topic) => !subscriptions.some((subscription: any) => subscription.topic === topic)), healthy: expectedTopics.every((topic) => subscriptions.some((subscription: any) => subscription.topic === topic)) } });
+    } catch (err: any) { return res.status(502).json({ success: false, error: { code: "SHOPIFY_SUBSCRIPTION_CHECK_FAILED", message: err.message } }); }
+  });
+
+  router.post("/webhook-subscriptions/repair", requireAuth, requireAnyRole("super_admin"), async (_req: any, res: any) => {
+    const config = getShopifyConfig();
+    const callbackUrl = String(process.env.SHOPIFY_WEBHOOK_CALLBACK_URL || "").trim();
+    if (!config.configured || !callbackUrl) return res.status(400).json({ success: false, error: { code: "SHOPIFY_WEBHOOK_CALLBACK_NOT_CONFIGURED", message: "Set SHOPIFY_WEBHOOK_CALLBACK_URL before repairing subscriptions." } });
+    try {
+      const expectedTopics = ["ORDERS_CREATE", "ORDERS_UPDATED", "ORDERS_EDITED", "ORDERS_CANCELLED", "ORDERS_PAID", "REFUNDS_CREATE"];
+      const results = [];
+      for (const topic of expectedTopics) {
+        results.push(await shopifyGraphQL(config, "mutation CreateWebhook($topic: WebhookSubscriptionTopic!, $callbackUrl: URL!) { webhookSubscriptionCreate(topic: $topic, webhookSubscription: { callbackUrl: $callbackUrl }) { userErrors { field message } webhookSubscription { id topic } } }", { topic, callbackUrl }));
+      }
+      return res.json({ success: true, data: { repaired: results.length, results } });
+    } catch (err: any) { return res.status(502).json({ success: false, error: { code: "SHOPIFY_SUBSCRIPTION_REPAIR_FAILED", message: err.message } }); }
   });
 
   // 2. POST /api/shopify/test-connection
@@ -119,6 +139,80 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
     }
   });
 
+  async function shopifyGraphQL(config: { storeDomain: string; accessToken: string; apiVersion: string }, query: string, variables: Record<string, unknown> = {}) {
+    let lastError = "Shopify GraphQL request failed";
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const response = await fetch(`https://${config.storeDomain}/admin/api/${config.apiVersion}/graphql.json`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": config.accessToken },
+        body: JSON.stringify({ query, variables })
+      });
+      if (response.ok) {
+        const json = await response.json();
+        if (Array.isArray(json.errors) && json.errors.length > 0) {
+          lastError = json.errors.map((error: any) => error.message).join("; ");
+          const throttled = json.errors.some((error: any) => String(error.extensions?.code || "").toUpperCase().includes("THROTTL"));
+          if (!throttled) throw new Error(lastError);
+        } else return json;
+      } else {
+        lastError = `Shopify GraphQL API error (HTTP ${response.status})`;
+        if (![429, 500, 502, 503, 504].includes(response.status)) throw new Error(`${lastError}: ${await response.text()}`);
+      }
+      const retryAfter = Math.min(2000, Math.max(100, Number(response.headers.get("retry-after") || 0) * 1000 || 250 * (attempt + 1)));
+      await new Promise((resolve) => setTimeout(resolve, retryAfter));
+    }
+    throw new Error(lastError);
+  }
+
+  async function processShopifyOutboundQueue() {
+    const config = getShopifyConfig();
+    if (!config.configured) return { skipped: true, processed: 0 };
+    const [pendingSnapshot, failedSnapshot] = await Promise.all([
+      db.collection("shopifyOutboundEvents").where("status", "==", "PENDING").limit(25).get(),
+      db.collection("shopifyOutboundEvents").where("status", "==", "FAILED").limit(25).get()
+    ]);
+    const events = [...pendingSnapshot.docs, ...failedSnapshot.docs].filter((doc: any) => Number(doc.data()?.retryCount || 0) < 5);
+    let processed = 0;
+    for (const eventDoc of events) {
+      const event = eventDoc.data() || {};
+      const processingAt = new Date().toISOString();
+      await eventDoc.ref.set({ status: "PROCESSING", processingAt }, { merge: true });
+      try {
+        const result = await shopifyGraphQL(config, "mutation SetRiderControlMetafields($metafields: [MetafieldsSetInput!]!) { metafieldsSet(metafields: $metafields) { userErrors { field message } } }", {
+          metafields: [{ ownerId: `gid://shopify/Order/${event.shopifyOrderId}`, namespace: "rider_control", key: "last_event", type: "json", value: JSON.stringify({ eventType: event.eventType, ...event.payload }) }]
+        });
+        const userErrors = result.data?.metafieldsSet?.userErrors || [];
+        if (userErrors.length > 0) throw new Error(userErrors.map((error: any) => error.message).join("; "));
+        await eventDoc.ref.set({ status: "SENT", sentAt: new Date().toISOString(), lastError: null }, { merge: true });
+        processed++;
+      } catch (error: any) {
+        const retryCount = Number(event.retryCount || 0) + 1;
+        await eventDoc.ref.set({ status: retryCount >= 5 ? "DEAD_LETTER" : "FAILED", retryCount, lastError: error.message, lastAttemptAt: new Date().toISOString() }, { merge: true });
+      }
+    }
+    return { skipped: false, processed };
+  }
+
+  async function recordShopifySuccess(topic: string, shopifyUpdatedAt: string | null, timestamp: string) {
+    await db.collection("integrationCheckpoints").doc("shopify").set({ lastWebhookAt: timestamp, lastSuccessfulWebhookAt: timestamp, lastShopifyUpdatedAtCheckpoint: shopifyUpdatedAt || null, updatedAt: timestamp }, { merge: true });
+    await db.collection("auditEvents").doc(`shopify_${crypto.createHash("sha256").update(`${topic}:${timestamp}:${shopifyUpdatedAt || ""}`).digest("hex")}`).set({ actorType: "SYSTEM", source: "SHOPIFY", topic, shopifyUpdatedAt, processedAt: timestamp, createdAt: timestamp }, { merge: true });
+  }
+
+  async function countShopifyEvents(status: string) {
+    const query = db.collection("shopifyWebhookEvents").where("status", "==", status);
+    if (typeof (query as any).count === "function") return Number((await (query as any).count().get()).data().count || 0);
+    return (await query.get()).size;
+  }
+
+  async function getShopifyHealth() {
+    const checkpoint = (await db.collection("integrationCheckpoints").doc("shopify").get()).data() || {};
+    const config = getShopifyConfig();
+    const [received, processed, retry, failed, deadLetter] = await Promise.all([
+      countShopifyEvents("RECEIVED"), countShopifyEvents("PROCESSED"), countShopifyEvents("RETRY"), countShopifyEvents("FAILED"), countShopifyEvents("DEAD_LETTER")
+    ]);
+    return { connected: config.configured, apiVersion: config.apiVersion, ...checkpoint, eventCounts: { received, processed, retry, failed, deadLetter } };
+  }
+
   // Helper to fetch and normalize Shopify orders
   async function fetchAndNormalizeShopifyOrders(config: { storeDomain: string; accessToken: string; apiVersion: string }, options: { limit?: number; status?: string; fulfillmentStatus?: string; updatedSince?: string } = {}) {
     const limit = Math.min(Math.max(Number(options.limit || 50), 1), 250);
@@ -128,17 +222,7 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
     const queryParts = [`status:${status}`];
     if (fulfillmentStatus) queryParts.push(`fulfillment_status:${fulfillmentStatus}`);
     if (options.updatedSince) queryParts.push(`updated_at:>=${options.updatedSince}`);
-    const response = await fetch(`https://${config.storeDomain}/admin/api/${config.apiVersion}/graphql.json`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "X-Shopify-Access-Token": config.accessToken },
-      body: JSON.stringify({
-        query: `query Orders($first: Int!, $query: String) { orders(first: $first, query: $query, sortKey: UPDATED_AT, reverse: true) { nodes { id legacyResourceId name orderNumber createdAt updatedAt cancelledAt financialStatus currentTotalPriceSet { shopMoney { amount currencyCode } } totalPriceSet { shopMoney { amount currencyCode } } totalOutstandingSet { shopMoney { amount currencyCode } } email phone note tags paymentGatewayNames customer { firstName lastName email phone } shippingAddress { firstName lastName phone address1 address2 city province country } lineItems(first: 100) { nodes { title name quantity sku variantTitle variant { id } originalUnitPriceSet { shopMoney { amount } } } } } } }`,
-        variables: { first: limit, query: queryParts.join(" ") }
-      })
-    });
-    if (!response.ok) throw new Error(`Shopify GraphQL API error (HTTP ${response.status}): ${await response.text()}`);
-    const json = await response.json();
-    if (Array.isArray(json.errors) && json.errors.length > 0) throw new Error(`Shopify GraphQL query failed: ${json.errors.map((error: any) => error.message).join("; ")}`);
+    const json = await shopifyGraphQL(config, `query Orders($first: Int!, $query: String) { orders(first: $first, query: $query, sortKey: UPDATED_AT, reverse: true) { nodes { id legacyResourceId name orderNumber createdAt updatedAt cancelledAt financialStatus currentTotalPriceSet { shopMoney { amount currencyCode } } totalPriceSet { shopMoney { amount currencyCode } } totalOutstandingSet { shopMoney { amount currencyCode } } email phone note tags paymentGatewayNames customer { id firstName lastName email phone } shippingAddress { firstName lastName phone address1 address2 city province country zip } lineItems(first: 100) { nodes { title name quantity sku variantTitle variant { id } originalUnitPriceSet { shopMoney { amount } } } } } } }`, { first: limit, query: queryParts.join(" ") });
     const rawOrders: any[] = (json.data?.orders?.nodes || []).map((order: any) => ({
       ...order,
       id: order.legacyResourceId || String(order.id || "").split("/").pop(),
@@ -249,6 +333,7 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
         email: customer.email || ord.email || null,
         deliveryInstructions: ord.note || null,
         paymentMethod,
+        paymentType: isPrepaid ? "PREPAID" : (financialStatus === "partially_paid" ? "PARTIALLY_PAID" : "COD"),
         paymentStatus,
         financialStatus,
         orderAmount: totalAmount,
@@ -695,9 +780,7 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
             }
           });
         }
-        const rawBody = Buffer.isBuffer(req.rawBody) ? req.rawBody : Buffer.from(JSON.stringify(req.body || {}));
-        const expectedHmac = crypto.createHmac("sha256", configuredShopifyWebhookSecret).update(rawBody).digest("base64");
-        if (!timingSafeSecretMatch(shopifyHmacHeader, expectedHmac)) {
+        if (!Buffer.isBuffer(req.rawBody) || !verifyShopifyWebhookHmac(req.rawBody, shopifyHmacHeader, configuredShopifyWebhookSecret)) {
           return res.status(401).json({
             success: false,
             error: {
@@ -716,7 +799,7 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
             }
           });
         }
-        if (!timingSafeSecretMatch(makeSecretHeader, configuredMakeSecret)) {
+        if (!verifyGomilaIntegrationSecret(makeSecretHeader, configuredMakeSecret)) {
           return res.status(401).json({
             success: false,
             error: {
@@ -747,9 +830,11 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
         const existing = await transaction.get(inboxRef);
         const existingEvent = existing.exists ? existing.data() || {} : {};
         if (["PROCESSED", "PROCESSING"].includes(String(existingEvent.status || ""))) return { duplicate: true, status: existingEvent.status };
-        transaction.set(inboxRef, { eventId, topic, shopDomain, shopifyOrderId: String(rawOrder.id || rawOrder.order_number || rawOrder.name), shopifyUpdatedAt, receivedAt: existingEvent.receivedAt || new Date().toISOString(), processedAt: null, status: "PROCESSING", retryCount: Number(existingEvent.retryCount || 0) + 1, error: null, payloadHash, payload: req.body }, { merge: true });
+        const processingStartedAt = new Date().toISOString();
+        transaction.set(inboxRef, { eventId, topic, shopDomain, shopifyOrderId: String(rawOrder.id || rawOrder.order_number || rawOrder.name), shopifyUpdatedAt, receivedAt: existingEvent.receivedAt || processingStartedAt, processingStartedAt, processedAt: null, status: "PROCESSING", retryCount: Number(existingEvent.retryCount || 0) + 1, errorCode: null, errorMessage: null, payloadHash, payload: req.body }, { merge: true });
         return { duplicate: false, status: "PROCESSING" };
       });
+      await db.collection("integrationCheckpoints").doc("shopify").set({ lastWebhookAt: new Date().toISOString(), updatedAt: new Date().toISOString() }, { merge: true });
       if (reservation.duplicate) return res.json({ success: true, data: { duplicate: true, eventId, status: reservation.status } });
 
       const displayOrderNumber = rawOrder.name ? cleanExcelFormulaString(rawOrder.name) : `#${rawOrder.order_number || rawOrder.id}`;
@@ -780,36 +865,12 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
       const isMissingCity = !rawCity;
       const isMissingAddress = !address;
 
-      const totalAmount = Math.round(Number(rawOrder.total_price || 0));
-      const financialStatus = (rawOrder.financial_status || "").toLowerCase().trim();
-      const rawPaymentGateway = (rawOrder.payment_gateway_names?.[0] || rawOrder.gateway || "").toLowerCase().trim();
-
-      // Canonical Payment Normalization (Gate 16)
-      const isPaidStatus = financialStatus === "paid";
-      const isPartiallyPaid = financialStatus === "partially_paid";
-      const isPrepaidGateway = rawPaymentGateway.includes("card") || rawPaymentGateway.includes("prepaid") || rawPaymentGateway.includes("bank") || rawPaymentGateway.includes("stripe");
-
-      let paymentType: "COD" | "PREPAID" | "PARTIALLY_PAID" = "COD";
-      let paymentMethod = "COD";
-      let paymentStatus = "unpaid";
-      let codExpected = 0;
-
-      if (isPaidStatus || (!financialStatus && isPrepaidGateway)) {
-        paymentType = "PREPAID";
-        paymentMethod = "PREPAID";
-        paymentStatus = "paid";
-        codExpected = 0;
-      } else if (isPartiallyPaid) {
-        paymentType = "PARTIALLY_PAID";
-        paymentMethod = "COD";
-        paymentStatus = "partially_paid";
-        codExpected = Math.round(Number(rawOrder.total_outstanding || 0));
-      } else {
-        paymentType = "COD";
-        paymentMethod = "COD";
-        paymentStatus = "unpaid";
-        codExpected = Math.round(Number(rawOrder.total_outstanding || rawOrder.current_total_price || rawOrder.total_price || 0));
-      }
+      const payment = normalizeShopifyPayment(rawOrder);
+      const totalAmount = payment.total;
+      const paymentType = payment.paymentType;
+      const paymentMethod = payment.paymentMethod;
+      const paymentStatus = payment.paymentStatus;
+      const codExpected = payment.codExpected;
 
       let deliveryChannel = "unassigned";
       if (!isMissingCity) {
@@ -833,6 +894,15 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
 
       const itemSummary = items.map((i: any) => `${i.quantity}x ${i.itemTitle}${i.variantTitle ? ` (${i.variantTitle})` : ""}`).join("; ") || "Gomila Footwear";
       const timestamp = new Date().toISOString();
+      const readiness = evaluateShopifyReadiness({
+        phone: customerPhone,
+        address,
+        city,
+        deliveryChannel,
+        paymentType,
+        cancelled: topic === "ORDERS_CANCELLED" || Boolean(rawOrder.cancelled_at),
+        tags: rawOrder.tags
+      });
 
       const packageRef = db.collection("packages").doc(packageId);
       const existingPackageSnap = await packageRef.get();
@@ -849,10 +919,30 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
         city,
         province,
         orderAmount: totalAmount,
+        orderNumber: displayOrderNumber,
+        customerId: customer.id || rawOrder.customer_id || null,
+        customerEmail: customer.email || rawOrder.email || null,
+        shippingName: customerName,
+        address1: shippingAddress.address1 || "",
+        address2: shippingAddress.address2 || "",
+        postalCode: shippingAddress.zip || shippingAddress.postal_code || null,
+        country: shippingAddress.country || null,
+        subtotal: Number(rawOrder.subtotal_price || rawOrder.subtotal || 0),
+        discount: Number(rawOrder.total_discounts || rawOrder.discount || 0),
+        total: payment.total,
+        amountPaid: payment.amountPaid,
+        amountOutstanding: payment.amountOutstanding,
+        fulfillmentStatus: rawOrder.fulfillment_status || rawOrder.fulfillmentStatus || null,
+        cancelledAt: rawOrder.cancelled_at || null,
+        refunds: rawOrder.refunds || [],
+        tags: rawOrder.tags || [],
+        notes: rawOrder.note || rawOrder.notes || null,
+        readinessStatus: readiness.ready ? "READY_FOR_DISPATCH" : "IMPORTED_REVIEW",
+        readinessHolds: readiness.holds,
         paymentType,
         paymentMethod,
         paymentStatus,
-        financialStatus,
+        financialStatus: String(rawOrder.financial_status || rawOrder.financialStatus || "").toLowerCase(),
         codExpected,
         items,
         itemSummary,
@@ -865,6 +955,7 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
       if (topic === "REFUNDS_CREATE") {
         await db.collection("shopifyRefunds").doc(eventId).set({ id: eventId, eventId, shopifyOrderId: commerceMirror.shopifyOrderId, refundId: rawOrder.refund_id || rawOrder.id, amount: Number(rawOrder.amount || rawOrder.refunds?.[0]?.transactions?.[0]?.amount || 0), currency: rawOrder.currency || "PKR", status: "RECORDED", receivedAt: timestamp, payloadHash }, { merge: true });
         if (existingPackage) await db.collection("exceptions").doc(`shopify_refund_${eventId}`).set({ id: `shopify_refund_${eventId}`, code: "SHOPIFY_REFUND_REVERSE_LOGISTICS_REVIEW", topic, packageId, shopifyOrderId: commerceMirror.shopifyOrderId, status: "OPEN", resolutionStatus: "pending", severity: "MEDIUM", message: "Commercial refund recorded. Physical package return requires separate reverse-logistics decision.", createdAt: timestamp }, { merge: true });
+        await recordShopifySuccess(topic, shopifyUpdatedAt, timestamp);
         await inboxRef.set({ status: "PROCESSED", processedAt: timestamp, error: null }, { merge: true });
         return res.json({ success: true, data: { eventId, refundRecorded: true, packageId: existingPackage ? packageId : null } });
       }
@@ -874,7 +965,7 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
         const existingMirrorSnap = await mirrorRef.get();
         const previousUpdatedAt = existingMirrorSnap.data()?.shopifyUpdatedAt;
         if (isOlderShopifyEvent(previousUpdatedAt, shopifyUpdatedAt)) {
-          await inboxRef.set({ status: "PROCESSED", processedAt: timestamp, error: null }, { merge: true });
+          await inboxRef.set({ status: "IGNORED_STALE", processedAt: timestamp, processingStartedAt: timestamp, errorCode: "STALE_SHOPIFY_EVENT", errorMessage: "Ignored because a newer Shopify mirror version already exists." }, { merge: true });
           return res.json({ success: true, data: { eventId, stale: true, packageId } });
         }
         await mirrorRef.set({ ...commerceMirror, createdAt: existingMirrorSnap.data()?.createdAt || timestamp }, { merge: true });
@@ -885,10 +976,17 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
           if (topic === "ORDERS_CANCELLED") await packageRef.set({ stopDeliveryInstruction: true, returnInstruction: "RETURN_TO_HUB", operationalExceptionCode: "STOP_DELIVERY", updatedAt: timestamp }, { merge: true });
           if (changedFields.includes("PAYMENT_CHANGED_DURING_CUSTODY") && paymentStatus === "paid") await packageRef.set({ codExpected: 0, expectedCod: 0, cod_expected: 0, collectionInstruction: "DO_NOT_COLLECT_COD_ONLINE_PAID", updatedAt: timestamp }, { merge: true });
         } else if (!hasCustody && topic !== "ORDERS_CANCELLED") {
-          await packageRef.set({ customerName, customerPhone, deliveryAddress: address || "Address not provided", city, province, paymentMethod, paymentStatus, codExpected, expectedCod: codExpected, cod_expected: codExpected, orderAmount: totalAmount, updatedAt: timestamp }, { merge: true });
+          await packageRef.set(applyShopifyCommerceUpdate(existingPackage, { customerName, customerPhone, deliveryAddress: address || "Address not provided", city, province, paymentType, paymentMethod, paymentStatus, codExpected, expectedCod: codExpected, cod_expected: codExpected, orderAmount: totalAmount, shopifyOrderId: commerceMirror.shopifyOrderId, shopifyUpdatedAt }), { merge: true });
         } else if (!hasCustody && topic === "ORDERS_CANCELLED") {
-          await packageRef.set({ operationalStatus: "cancelled", current_status: "Cancelled", cancellationSource: "shopify", updatedAt: timestamp }, { merge: true });
+          await packageRef.set({ operationalStatus: "cancelled", current_status: "Cancelled", cancellationSource: "shopify", activeAssignmentId: null, assignedRiderId: null, updatedAt: timestamp }, { merge: true });
+          const assignmentSnapshot = await db.collection("assignments").where("packageId", "==", packageId).where("active", "==", true).get();
+          if (assignmentSnapshot.size > 0) {
+            const assignmentBatch = db.batch();
+            assignmentSnapshot.docs.forEach((assignment: any) => assignmentBatch.set(assignment.ref, { active: false, cancelledAt: timestamp, cancellationSource: "shopify" }, { merge: true }));
+            await assignmentBatch.commit();
+          }
         }
+        await recordShopifySuccess(topic, shopifyUpdatedAt, timestamp);
         await inboxRef.set({ status: "PROCESSED", processedAt: timestamp, error: null }, { merge: true });
         return res.json({ success: true, data: { eventId, duplicate: false, updated: true, packageId, custodyProtected: hasCustody } });
       }
@@ -929,14 +1027,14 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
         deliveryChannel,
         delivery_channel: deliveryChannel,
         importState: "committed",
-        operationalStatus: (!isMissingCity && !isMissingAddress && deliveryChannel === "internal_rider") ? "ready_for_dispatch" : "imported_review",
-        current_status: (!isMissingCity && !isMissingAddress && deliveryChannel === "internal_rider") ? "Ready for Dispatch" : "Imported",
+        operationalStatus: readiness.ready ? "ready_for_dispatch" : "imported_review",
+        current_status: readiness.ready ? "Ready for Dispatch" : "Imported",
         activeAssignmentId: null,
         assignedRiderId: null,
         itemSummary,
         totalQuantity: items.reduce((acc: number, item: any) => acc + item.quantity, 0),
-        hasException: isMissingCity || isMissingAddress,
-        exceptionReason: isMissingCity ? "ADDRESS_REVIEW_REQUIRED (Missing City)" : (isMissingAddress ? "ADDRESS_REVIEW_REQUIRED (Incomplete Address)" : null),
+        hasException: !readiness.ready,
+        exceptionReason: readiness.reason,
         addressIncomplete: isMissingCity || isMissingAddress,
         source: "shopify",
         shopifyId: rawOrder.id,
@@ -948,12 +1046,18 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
       await packageRef.set(pkgDoc, { merge: true });
       await db.collection("orders").doc(packageId).set(pkgDoc, { merge: true });
       await db.collection("shopifyOrders").doc(String(rawOrder.id || rawOrder.order_number || rawOrder.name)).set({ ...commerceMirror, createdAt: timestamp }, { merge: true });
+      await recordShopifySuccess(topic, shopifyUpdatedAt, timestamp);
       await inboxRef.set({ status: "PROCESSED", processedAt: timestamp, error: null }, { merge: true });
 
       return res.json({ success: true, data: { ...pkgDoc, eventId } });
     } catch (err: any) {
       const eventId = req.headers["x-shopify-webhook-id"];
-      if (eventId) await db.collection("shopifyWebhookEvents").doc(String(eventId)).set({ status: Number((await db.collection("shopifyWebhookEvents").doc(String(eventId)).get()).data()?.retryCount || 0) >= 5 ? "DEAD_LETTER" : "FAILED", error: err.message, lastAttemptAt: new Date().toISOString() }, { merge: true });
+      if (eventId) {
+        const failedRef = db.collection("shopifyWebhookEvents").doc(String(eventId));
+        const failedSnap = await failedRef.get();
+        const retryCount = Number(failedSnap.data()?.retryCount || 0);
+        await failedRef.set({ status: retryCount >= 5 ? "DEAD_LETTER" : "RETRY", errorCode: "ORDER_INGESTION_FAILED", errorMessage: err.message, lastAttemptAt: new Date().toISOString() }, { merge: true });
+      }
       return res.status(500).json({ success: false, error: { code: "ORDER_INGESTION_FAILED", message: err.message } });
     }
   }
@@ -976,7 +1080,22 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
       mirrorsRepaired++;
       if (!packageSnap.exists) {
         missingLocal++;
-        await db.collection("exceptions").doc(`shopify_missing_${order.shopifyId}`).set({ id: `shopify_missing_${order.shopifyId}`, code: "SHOPIFY_ORDER_MISSING_LOCALLY", shopifyOrderId: String(order.shopifyId), status: "OPEN", resolutionStatus: "pending", severity: "HIGH", message: "Shopify order exists but no operational package is present; recovery intake required.", createdAt: timestamp }, { merge: true });
+        const recoveryReadiness = evaluateShopifyReadiness({ phone: order.customerPhone, address: order.deliveryAddress === "Address not provided" ? "" : order.deliveryAddress, city: order.city, deliveryChannel: order.deliveryChannel, paymentType: order.paymentType, tags: order.tags });
+        const recoveredPackage = {
+          id: order.packageId, packageId: order.packageId, packageNumber: order.packageNumber, package_number: order.packageNumber,
+          displayOrderNumber: order.displayOrderNumber, externalOrderId: order.externalOrderId, customerName: order.customerName,
+          customerPhone: order.customerPhone, deliveryAddress: order.deliveryAddress, address: order.deliveryAddress, city: order.city,
+          province: order.province, paymentType: order.paymentType, paymentMethod: order.paymentMethod, paymentStatus: order.paymentStatus,
+          orderAmount: order.orderAmount, codExpected: order.codExpected, expectedCod: order.codExpected, cod_expected: order.codExpected,
+          currency: order.currency, courierType: order.courierType, deliveryChannel: order.deliveryChannel, itemSummary: order.itemSummary,
+          totalQuantity: order.totalQuantity, hasException: !recoveryReadiness.ready, exceptionReason: recoveryReadiness.reason,
+          addressIncomplete: !order.city || order.deliveryAddress === "Address not provided", source: "shopify", shopifyId: order.shopifyId,
+          operationalStatus: recoveryReadiness.ready ? "ready_for_dispatch" : "imported_review", current_status: recoveryReadiness.ready ? "Ready for Dispatch" : "Imported",
+          activeAssignmentId: null, assignedRiderId: null, importState: "committed", createdAt: timestamp, updatedAt: timestamp
+        };
+        await packageRef.set(recoveredPackage, { merge: true });
+        await db.collection("orders").doc(order.packageId).set(recoveredPackage, { merge: true });
+        if (!recoveryReadiness.ready) await db.collection("exceptions").doc(`shopify_recovery_${order.shopifyId}`).set({ id: `shopify_recovery_${order.shopifyId}`, code: recoveryReadiness.reason, shopifyOrderId: String(order.shopifyId), packageId: order.packageId, status: "OPEN", resolutionStatus: "pending", severity: "HIGH", message: "Recovered Shopify order requires readiness review.", createdAt: timestamp }, { merge: true });
         continue;
       }
       const pkg = packageSnap.data() || {};
@@ -1011,6 +1130,10 @@ export function createShopifyRouter({ db, requireAuth, requireAnyRole }: Shopify
     runShopifyReconciliation().catch((error) => console.error("Shopify reconciliation job failed", error));
   }, reconciliationIntervalMs);
   reconciliationTimer.unref?.();
+  const outboundTimer = setInterval(() => {
+    processShopifyOutboundQueue().catch((error) => console.error("Shopify outbound queue failed", error));
+  }, 60 * 1000);
+  outboundTimer.unref?.();
 
   router.post("/webhooks/:eventId/replay", requireAuth, requireAnyRole("super_admin", "dispatch_manager"), async (req: any, res: any) => {
     const eventRef = db.collection("shopifyWebhookEvents").doc(String(req.params.eventId));

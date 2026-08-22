@@ -40,6 +40,7 @@ export function RiderPackageCard({
   const city = order.city || 'Lahore';
   const zone = (order as any).zone || '';
   const status = ((order as any).operational_status || (order as any).operationalStatus || order.current_status || 'OUT_FOR_DELIVERY');
+  const stopDelivery = Boolean((order as any).stopDeliveryInstruction || (order as any).operationalExceptionCode === 'STOP_DELIVERY');
 
   // Safe COD check: canonical codExpected or cod_expected
   const codExpected = order.cod_expected !== undefined ? order.cod_expected : ((order as any).codExpected || 0);
@@ -90,6 +91,13 @@ export function RiderPackageCard({
         </div>
       </div>
 
+      {stopDelivery && (
+        <div className="rounded-xl border-2 border-red-500 bg-red-50 p-3 text-center text-xs font-black text-red-800">
+          DO NOT DELIVER — SHOPIFY ORDER CANCELLED
+          <div className="mt-1 text-[10px] font-bold">RETURN TO HUB</div>
+        </div>
+      )}
+
       {/* Customer Info */}
       <div className="space-y-0.5">
         <h4 className="text-sm font-black text-[#1F1F1D]">{customerName}</h4>
@@ -123,7 +131,7 @@ export function RiderPackageCard({
       </div>
 
       {/* Large Actions (Min 44px) */}
-      <div className="grid grid-cols-3 gap-2">
+      {!stopDelivery && <div className="grid grid-cols-3 gap-2">
         <button
           onClick={handleCall}
           className="h-11 bg-white border border-[#DDD9D4] rounded-xl flex items-center justify-center space-x-1 text-xs font-bold text-[#1F1F1D] hover:bg-stone-50 active:scale-95 transition"
@@ -147,16 +155,16 @@ export function RiderPackageCard({
           <Navigation className="w-3.5 h-3.5" />
           <span>NAVIGATE</span>
         </button>
-      </div>
+      </div>}
 
       {/* Primary Action */}
-      <button
+      {!stopDelivery && <button
         onClick={() => onRecordAttempt(order)}
         className="w-full h-11 bg-[#5A2628] hover:bg-[#471D1F] text-white rounded-xl font-bold text-xs shadow-xs flex items-center justify-center space-x-2 active:scale-98 transition"
       >
         <CheckCircle2 className="w-4 h-4 text-emerald-400" />
         <span>RECORD ATTEMPT</span>
-      </button>
+      </button>}
     </div>
   );
 }

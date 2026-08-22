@@ -21,6 +21,7 @@ import { ReturnsWorkspace } from './components/returns/ReturnsWorkspace';
 import { LogisticsWorkspace } from './components/logistics/LogisticsWorkspace';
 import { ManagementDashboard } from './components/management/ManagementDashboard';
 import { UserManagementWorkspace } from './components/admin/UserManagementWorkspace';
+import { ShopifyIntegrationWorkspace } from './components/admin/ShopifyIntegrationWorkspace';
 import { LogOut, Loader2, AlertCircle } from 'lucide-react';
 
 function AppContent() {
@@ -130,7 +131,7 @@ function AppContent() {
       case 'management':
         return { title: 'Management Executive Dashboard', subtitle: 'Key operational metrics and exception analytics' };
       case 'admin':
-        return { title: 'Administration • User Management', subtitle: 'Employee account creation, role management and rider linking' };
+        return { title: activeSubTab === 'shopify' ? 'Administration / Shopify Integration' : 'Administration / User Management', subtitle: activeSubTab === 'shopify' ? 'Webhook health, recovery and continuous commerce connection' : 'Employee account creation, role management and rider linking' };
       default:
         return { title: 'Gomila Rider Control', subtitle: '' };
     }
@@ -191,7 +192,6 @@ function AppContent() {
 
               {activeSubTab === 'orders' && (
                 <OrdersScreen
-                  userRole={profile?.role}
                   initialFilterStatus={ordersFilterStatus}
                   onSelectOrder={(id) => setSelectedOrderId(id)}
                   selectedOrderId={selectedOrderId}
@@ -266,7 +266,7 @@ function AppContent() {
           {/* WORKSPACE 6: ADMINISTRATION USER MANAGEMENT */}
           {activeWorkspace === 'admin' && (
             <ErrorBoundary fallbackTitle="User Management Error">
-              <UserManagementWorkspace activeSubTab={activeSubTab} />
+              {activeSubTab === 'shopify' ? <ShopifyIntegrationWorkspace /> : <UserManagementWorkspace activeSubTab={activeSubTab} />}
             </ErrorBoundary>
           )}
 
