@@ -1,0 +1,313 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function profileExists() {
+      return isAuthenticated() && exists(/databases/$(database)/documents/profiles/$(request.auth.uid));
+    }
+
+    function getUserData() {
+      return get(/databases/$(database)/documents/profiles/$(request.auth.uid)).data;
+    }
+
+    function isActive() {
+      return profileExists() && getUserData().active == true;
+    }
+
+    function getRiderId() {
+      return getUserData().riderId;
+    }
+
+    function hasRole(role) {
+      return isActive() && getUserData().role == role;
+    }
+
+    function isSuperAdmin() {
+      return hasRole('super_admin');
+    }
+
+    function isDispatchManager() {
+      return hasRole('dispatch_manager') || isSuperAdmin();
+    }
+
+    function isRider() {
+      return hasRole('rider');
+    }
+
+    function isCashier() {
+      return hasRole('cashier') || isSuperAdmin();
+    }
+
+    function isCustomerService() {
+      return hasRole('customer_service') || isSuperAdmin();
+    }
+
+    function isWarehouseStaff() {
+      return hasRole('warehouse_staff') || isSuperAdmin();
+    }
+
+    function isManagementViewer() {
+      return hasRole('management_viewer') || isSuperAdmin();
+    }
+
+    // Profiles
+    match /profiles/{userId} {
+      allow read: if isAuthenticated() && (request.auth.uid == userId || isSuperAdmin());
+      allow write: if false;
+    }
+
+    // Riders
+    match /riders/{riderId} {
+      allow read: if isActive() && (isDispatchManager() || isManagementViewer() || isCashier() || (isRider() && (resource.data.profileId == request.auth.uid || riderId == getRiderId())));
+      allow write: if false;
+    }
+
+    // Packages
+    match /packages/{packageId} {
+      allow read: if isActive() && (isDispatchManager() || isCustomerService() || isWarehouseStaff() || isManagementViewer() || (isRider() && resource.data.assignedRiderId == getRiderId()));
+      allow write: if false;
+    }
+
+    // Package Items
+    match /packageItems/{docId} {
+      allow read: if isActive() && (
+        isDispatchManager() ||
+        isCustomerService() ||
+        isWarehouseStaff() ||
+        isManagementViewer() || (
+          isRider()
+          && resource.data.packageId is string
+          && exists(/databases/$(database)/documents/packages/$(resource.data.packageId))
+          && get(/databases/$(database)/documents/packages/$(resource.data.packageId)).data.assignedRiderId == getRiderId()
+        )
+      );
+      allow write: if false;
+    }
+
+    // Customers & Addresses
+    match /customers/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isCustomerService() || isWarehouseStaff());
+      allow write: if false;
+    }
+    match /deliveryAddresses/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isCustomerService() || isWarehouseStaff());
+      allow write: if false;
+    }
+
+    // Assignments
+    match /assignments/{assignmentId} {
+      allow read: if isActive() && (isDispatchManager() || isCustomerService() || isWarehouseStaff() || isManagementViewer() || (isRider() && resource.data.riderId == getRiderId()));
+      allow write: if false;
+    }
+
+    // Dispatch Runs
+    match /dispatchRuns/{runId} {
+      allow read: if isActive() && (isDispatchManager() || isManagementViewer() || (isRider() && resource.data.riderId == getRiderId()));
+      allow write: if false;
+    }
+
+    // Delivery Attempts
+    match /deliveryAttempts/{attemptId} {
+      allow read: if isActive() && (isDispatchManager() || isCustomerService() || isManagementViewer() || (isRider() && resource.data.riderId == getRiderId()));
+      allow write: if false;
+    }
+
+    // Rider Settlements & Lines
+    match /riderSettlements/{settlementId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer() || (isRider() && resource.data.riderId == getRiderId()));
+      allow write: if false;
+    }
+    match /settlementLines/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer() || (isRider() && resource.data.riderId == getRiderId()));
+      allow write: if false;
+    }
+
+    // Parent Orders & COD Allocations
+    match /parentOrders/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isCustomerService() || isWarehouseStaff() || isManagementViewer());
+      allow write: if false;
+    }
+    match /codAllocations/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isCashier() || isManagementViewer());
+      allow write: if false;
+    }
+
+    // Import Batches & COD Allocation Reviews
+    match /importBatches/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /codAllocationReviews/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+
+    // Dispatch Run Packages & Custody Events
+    match /dispatchRunPackages/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isWarehouseStaff() || isManagementViewer());
+      allow write: if false;
+    }
+    match /custodyEvents/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isWarehouseStaff() || isManagementViewer());
+      allow write: if false;
+    }
+
+    // Delivery Proofs
+    match /deliveryProofs/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isManagementViewer() || (isRider() && resource.data.riderId == getRiderId()));
+      allow write: if false;
+    }
+
+    // COD Expectations & COD Collections
+    match /codExpectations/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /codCollections/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer() || (isRider() && resource.data.riderId == getRiderId()));
+      allow write: if false;
+    }
+
+    // Financial Collections
+    match /financialAccounts/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /financialTransactions/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /financialPostings/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /digitalPaymentVerifications/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /bankDeposits/{docId} {
+      allow read: if isActive() && (isCashier() || isManagementViewer());
+      allow write: if false;
+    }
+    match /bankDepositLines/{docId} {
+      allow read: if isActive() && (isCashier() || isManagementViewer());
+      allow write: if false;
+    }
+
+    // Returns & CS Cases
+    match /returns/{docId} {
+      allow read: if isActive() && (isWarehouseStaff() || isCustomerService() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /returnCustodyEvents/{docId} {
+      allow read: if isActive() && (isWarehouseStaff() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /returnReceipts/{docId} {
+      allow read: if isActive() && (isWarehouseStaff() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /reattemptRequests/{docId} {
+      allow read: if isActive() && (isCustomerService() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /customerServiceCases/{docId} {
+      allow read: if isActive() && (isCustomerService() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /customerContactAttempts/{docId} {
+      allow read: if isActive() && (isCustomerService() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /exchanges/{docId} {
+      allow read: if isActive() && (isCustomerService() || isWarehouseStaff() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /exchangePackages/{docId} {
+      allow read: if isActive() && (isCustomerService() || isWarehouseStaff() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+
+    // Courier Records
+    match /courierShipments/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /courierManifests/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /courierRemittanceBatches/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /courierRemittanceLines/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /courierDeductions/{docId} {
+      allow read: if isActive() && (isCashier() || isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /courierReturns/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isWarehouseStaff() || isManagementViewer());
+      allow write: if false;
+    }
+
+    // Audit Records (only super_admin and management_viewer, NO writes)
+    match /auditEvents/{docId} {
+      allow read: if isActive() && isManagementViewer();
+      allow write: if false;
+    }
+    match /financialAuditEvents/{docId} {
+      allow read: if isActive() && isManagementViewer();
+      allow write: if false;
+    }
+    match /idempotencyKeys/{docId} {
+      allow read: if false;
+      allow write: if false;
+    }
+    match /systemAlerts/{docId} {
+      allow read: if isActive() && isManagementViewer();
+      allow write: if false;
+    }
+    match /masterData/{docId} {
+      allow read: if isAuthenticated();
+      allow write: if false;
+    }
+
+    // Logistics Hub Collections (Server-Controlled Writes, Role-Based Reads)
+    match /shipments/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isCustomerService() || isWarehouseStaff() || isCashier() || isManagementViewer());
+      allow write: if false;
+    }
+    match /shipmentEvents/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isCustomerService() || isWarehouseStaff() || isCashier() || isManagementViewer());
+      allow write: if false;
+    }
+    match /importJobs/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+    match /physicalReturns/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isWarehouseStaff() || isManagementViewer());
+      allow write: if false;
+    }
+    match /exceptions/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isCustomerService() || isManagementViewer());
+      allow write: if false;
+    }
+    match /courierMappings/{docId} {
+      allow read: if isActive() && (isDispatchManager() || isManagementViewer());
+      allow write: if false;
+    }
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

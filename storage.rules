@@ -1,0 +1,82 @@
+rules_version = '2';
+service firebase.storage {
+  match /b/{bucket}/o {
+
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function getProfile() {
+      return firestore.get(/databases/(default)/documents/profiles/$(request.auth.uid)).data;
+    }
+
+    function isActive() {
+      return isAuthenticated() && getProfile().active == true;
+    }
+
+    function hasRole(role) {
+      return isActive() && getProfile().role == role;
+    }
+
+    function isSuperAdmin() {
+      return hasRole('super_admin');
+    }
+
+    function isDispatchManager() {
+      return hasRole('dispatch_manager') || isSuperAdmin();
+    }
+
+    function isCashier() {
+      return hasRole('cashier') || isSuperAdmin();
+    }
+
+    match /deliveryProofs/{riderUid}/{attemptId}/{fileName} {
+      allow create: if resource == null
+                    && isActive()
+                    && getProfile().role == 'rider'
+                    && request.auth.uid == riderUid
+                    && request.resource.size < 10 * 1024 * 1024
+                    && (request.resource.contentType == 'image/jpeg' ||
+                        request.resource.contentType == 'image/png' ||
+                        request.resource.contentType == 'image/webp');
+      allow read: if isActive() && (request.auth.uid == riderUid || isDispatchManager());
+      allow update, delete: if false;
+    }
+
+    match /settlementSlips/{riderUid}/{settlementId}/{fileName} {
+      allow create: if resource == null
+                    && isActive()
+                    && getProfile().role == 'rider'
+                    && request.auth.uid == riderUid
+                    && request.resource.size < 10 * 1024 * 1024
+                    && (request.resource.contentType == 'image/jpeg' ||
+                        request.resource.contentType == 'image/png' ||
+                        request.resource.contentType == 'application/pdf');
+      allow read: if isActive() && (request.auth.uid == riderUid || isCashier() || isDispatchManager());
+      allow update, delete: if false;
+    }
+
+    match /depositSlips/{depositId}/{fileName} {
+      allow create: if resource == null
+                    && isCashier()
+                    && request.resource.size < 10 * 1024 * 1024
+                    && (request.resource.contentType == 'image/jpeg' ||
+                        request.resource.contentType == 'image/png' ||
+                        request.resource.contentType == 'application/pdf');
+      allow read: if isCashier() || isDispatchManager();
+      allow update, delete: if false;
+    }
+
+    match /importFiles/{batchId}/{fileName} {
+      allow create: if resource == null
+                    && isDispatchManager()
+                    && request.resource.size < 50 * 1024 * 1024;
+      allow read: if isDispatchManager();
+      allow update, delete: if false;
+    }
+
+    match /{allPaths=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,457 @@
+{
+  "entities": {
+    "FinancialAccount": {
+      "title": "Financial Account",
+      "description": "Ledger account for double-entry bookkeeping",
+      "type": "object",
+      "properties": {
+        "code": { "type": "string" },
+        "name": { "type": "string" },
+        "accountType": { "type": "string", "enum": ["asset", "liability", "income", "expense", "clearing"] },
+        "active": { "type": "boolean" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["code", "name", "accountType", "active"]
+    },
+    "FinancialTransaction": {
+      "title": "Financial Transaction",
+      "description": "Double-entry transaction record header",
+      "type": "object",
+      "properties": {
+        "transactionType": { "type": "string" },
+        "sourceType": { "type": "string" },
+        "sourceId": { "type": "string" },
+        "packageId": { "type": "string" },
+        "riderId": { "type": "string" },
+        "cashierProfileId": { "type": "string" },
+        "settlementId": { "type": "string" },
+        "bankDepositId": { "type": "string" },
+        "status": { "type": "string", "enum": ["posted", "reversed"] },
+        "currency": { "type": "string" },
+        "totalDebit": { "type": "number" },
+        "totalCredit": { "type": "number" },
+        "idempotencyKey": { "type": "string" },
+        "createdByUid": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "reversedTransactionId": { "type": "string" },
+        "reversedByUid": { "type": "string" },
+        "reversedAt": { "type": "string" },
+        "reversalReason": { "type": "string" }
+      },
+      "required": ["transactionType", "status", "currency", "totalDebit", "totalCredit", "idempotencyKey", "createdByUid"]
+    },
+    "FinancialPosting": {
+      "title": "Financial Posting Line",
+      "description": "Individual debit or credit leg of a double-entry transaction",
+      "type": "object",
+      "properties": {
+        "transactionId": { "type": "string" },
+        "accountCode": { "type": "string" },
+        "debitAmount": { "type": "number" },
+        "creditAmount": { "type": "number" },
+        "packageId": { "type": "string" },
+        "riderId": { "type": "string" },
+        "settlementId": { "type": "string" },
+        "bankDepositId": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["transactionId", "accountCode", "debitAmount", "creditAmount"]
+    },
+    "CODCollection": {
+      "title": "COD Collection Record",
+      "description": "Recorded COD payment at package delivery completion",
+      "type": "object",
+      "properties": {
+        "packageId": { "type": "string" },
+        "riderId": { "type": "string" },
+        "expectedCod": { "type": "number" },
+        "collectedAmount": { "type": "number" },
+        "paymentMethod": { "type": "string", "enum": ["cash", "jazzcash", "easypaisa", "bank_transfer", "prepaid"] },
+        "digitalReference": { "type": "string" },
+        "collectionVariance": { "type": "number" },
+        "idempotencyKey": { "type": "string" },
+        "transactionId": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["packageId", "riderId", "collectedAmount", "paymentMethod", "idempotencyKey"]
+    },
+    "DigitalPaymentVerification": {
+      "title": "Digital Payment Verification",
+      "description": "Verification of non-cash digital COD references",
+      "type": "object",
+      "properties": {
+        "digitalReference": { "type": "string" },
+        "packageId": { "type": "string" },
+        "paymentMethod": { "type": "string" },
+        "amount": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending", "verified", "rejected"] },
+        "verifiedByUid": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["digitalReference", "packageId", "amount", "status"]
+    },
+    "RiderSettlement": {
+      "title": "Rider Settlement",
+      "description": "Financial reconciliation session between rider and cashier",
+      "type": "object",
+      "properties": {
+        "settlementNumber": { "type": "string" },
+        "riderId": { "type": "string" },
+        "status": { "type": "string", "enum": ["open", "rider_submitted", "cashier_received", "discrepancy", "manager_approved", "closed"] },
+        "calculatedCashObligation": { "type": "number" },
+        "declaredCashAmount": { "type": "number" },
+        "physicallyReceivedAmount": { "type": "number" },
+        "collectionVariance": { "type": "number" },
+        "riderHandoverVariance": { "type": "number" },
+        "cashierVariance": { "type": "number" },
+        "discrepancyAmount": { "type": "number" },
+        "discrepancyReason": { "type": "string" },
+        "notes": { "type": "string" },
+        "receiptNotes": { "type": "string" },
+        "submittedAt": { "type": "string" },
+        "receivedAt": { "type": "string" },
+        "approvedAt": { "type": "string" },
+        "approvedByUid": { "type": "string" },
+        "closedAt": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["riderId", "status"]
+    },
+    "SettlementLine": {
+      "title": "Settlement Line Item",
+      "description": "Itemized collection link within a rider settlement",
+      "type": "object",
+      "properties": {
+        "settlementId": { "type": "string" },
+        "packageId": { "type": "string" },
+        "collectedAmount": { "type": "number" },
+        "paymentMethod": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["settlementId", "packageId", "collectedAmount"]
+    },
+    "BankDeposit": {
+      "title": "Bank Deposit",
+      "description": "Cashier deposit of collected funds to bank account",
+      "type": "object",
+      "properties": {
+        "cashierProfileId": { "type": "string" },
+        "bankAccountCode": { "type": "string" },
+        "depositedAmount": { "type": "number" },
+        "depositReference": { "type": "string" },
+        "depositDate": { "type": "string" },
+        "depositSlipStoragePath": { "type": "string" },
+        "depositedByUid": { "type": "string" },
+        "verifiedByUid": { "type": "string" },
+        "verifiedAt": { "type": "string" },
+        "discrepancyAmount": { "type": "number" },
+        "discrepancyReason": { "type": "string" },
+        "status": { "type": "string", "enum": ["draft", "submitted", "verified", "discrepancy", "closed"] },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["cashierProfileId", "bankAccountCode", "depositedAmount", "depositReference", "status"]
+    },
+    "BankDepositLine": {
+      "title": "Bank Deposit Line",
+      "description": "Line items linked to bank deposit",
+      "type": "object",
+      "properties": {
+        "bankDepositId": { "type": "string" },
+        "settlementId": { "type": "string" },
+        "amount": { "type": "number" }
+      },
+      "required": ["bankDepositId", "amount"]
+    },
+    "FinancialAuditEvent": {
+      "title": "Financial Audit Event",
+      "description": "Immutable log for financial adjustments, discrepancies, and reversals",
+      "type": "object",
+      "properties": {
+        "eventType": { "type": "string" },
+        "entityType": { "type": "string" },
+        "entityId": { "type": "string" },
+        "actorUid": { "type": "string" },
+        "details": { "type": "object" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["eventType", "entityType", "entityId", "actorUid"]
+    },
+    "IdempotencyKey": {
+      "title": "Idempotency Key Record",
+      "description": "Deduplication lock for transactions and API requests",
+      "type": "object",
+      "properties": {
+        "key": { "type": "string" },
+        "action": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["key", "action"]
+    },
+    "Return": {
+      "title": "Return Record",
+      "description": "Package return request and status tracker",
+      "type": "object",
+      "properties": {
+        "packageId": { "type": "string" },
+        "riderId": { "type": "string" },
+        "status": { "type": "string", "enum": ["return_requested", "returning_to_warehouse", "rider_handed_back", "warehouse_received", "customer_service_review", "reattempt_scheduled", "exchange_created", "cancelled", "closed"] },
+        "returnReason": { "type": "string" },
+        "quantity": { "type": "number" },
+        "riderNotes": { "type": "string" },
+        "handoffEmployee": { "type": "string" },
+        "idempotencyKey": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["packageId", "status", "returnReason"]
+    },
+    "ReturnCustodyEvent": {
+      "title": "Return Custody Event",
+      "description": "Custody chain event during return processing",
+      "type": "object",
+      "properties": {
+        "returnId": { "type": "string" },
+        "packageId": { "type": "string" },
+        "eventType": { "type": "string" },
+        "actorUid": { "type": "string" },
+        "notes": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["returnId", "packageId", "eventType", "actorUid"]
+    },
+    "ReturnReceipt": {
+      "title": "Return Receipt",
+      "description": "Warehouse physical receipt of returned package",
+      "type": "object",
+      "properties": {
+        "returnId": { "type": "string" },
+        "packageId": { "type": "string" },
+        "scannedPackageNumber": { "type": "string" },
+        "receivedQuantity": { "type": "number" },
+        "packageCondition": { "type": "string", "enum": ["sealed", "opened", "damaged", "missing_item", "wrong_item"] },
+        "restockable": { "type": "boolean" },
+        "conditionNotes": { "type": "string" },
+        "receivedByUid": { "type": "string" },
+        "idempotencyKey": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["packageId", "scannedPackageNumber", "receivedQuantity", "packageCondition", "receivedByUid"]
+    },
+    "ReattemptRequest": {
+      "title": "Reattempt Request",
+      "description": "Customer service delivery reattempt approval record",
+      "type": "object",
+      "properties": {
+        "packageId": { "type": "string" },
+        "caseId": { "type": "string" },
+        "newPromisedDeliveryDate": { "type": "string" },
+        "validAddress": { "type": "string" },
+        "customerConfirmationStatus": { "type": "string" },
+        "assignedCsOwner": { "type": "string" },
+        "reason": { "type": "string" },
+        "attemptNumber": { "type": "number" },
+        "status": { "type": "string", "enum": ["pending_approval", "approved", "dispatched", "rejected"] },
+        "approvedByUid": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["packageId", "newPromisedDeliveryDate", "status"]
+    },
+    "CustomerServiceCase": {
+      "title": "Customer Service Case",
+      "description": "Delivery exception case handled by CS team",
+      "type": "object",
+      "properties": {
+        "packageId": { "type": "string" },
+        "customerId": { "type": "string" },
+        "caseType": { "type": "string" },
+        "ownerProfileId": { "type": "string" },
+        "priority": { "type": "string", "enum": ["normal", "high", "urgent"] },
+        "status": { "type": "string", "enum": ["open", "contacting", "waiting_customer", "resolved", "closed"] },
+        "nextActionAt": { "type": "string" },
+        "attemptCount": { "type": "number" },
+        "resolution": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["packageId", "caseType", "priority", "status"]
+    },
+    "CustomerContactAttempt": {
+      "title": "Customer Contact Attempt",
+      "description": "Log of CS communication attempt with customer",
+      "type": "object",
+      "properties": {
+        "caseId": { "type": "string" },
+        "packageId": { "type": "string" },
+        "userUid": { "type": "string" },
+        "channel": { "type": "string", "enum": ["call", "whatsapp", "sms", "email"] },
+        "result": { "type": "string" },
+        "notes": { "type": "string" },
+        "nextAction": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["caseId", "userUid", "channel", "result"]
+    },
+    "Exchange": {
+      "title": "Exchange Record",
+      "description": "Product exchange mapping original to replacement package",
+      "type": "object",
+      "properties": {
+        "originalPackageId": { "type": "string" },
+        "replacementPackageId": { "type": "string" },
+        "priceDifference": { "type": "number" },
+        "additionalCod": { "type": "number" },
+        "refundAmount": { "type": "number" },
+        "exchangeReason": { "type": "string" },
+        "warehouseCondition": { "type": "string" },
+        "csApprovalUid": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "approved", "dispatched", "completed", "cancelled"] },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["originalPackageId", "replacementPackageId", "exchangeReason", "status"]
+    },
+    "ExchangePackage": {
+      "title": "Exchange Package Link",
+      "description": "Link item for exchange package metadata",
+      "type": "object",
+      "properties": {
+        "exchangeId": { "type": "string" },
+        "packageId": { "type": "string" },
+        "type": { "type": "string", "enum": ["original", "replacement"] }
+      },
+      "required": ["exchangeId", "packageId", "type"]
+    },
+    "CourierShipment": {
+      "title": "Courier Shipment",
+      "description": "Package handed over to external 3PL courier",
+      "type": "object",
+      "properties": {
+        "packageId": { "type": "string" },
+        "courierCompanyId": { "type": "string" },
+        "trackingNumber": { "type": "string" },
+        "manifestId": { "type": "string" },
+        "dispatchedAt": { "type": "string" },
+        "courierStatus": { "type": "string", "enum": ["booked", "picked_up", "in_transit", "out_for_delivery", "delivered", "returning", "returned", "lost", "cancelled"] },
+        "expectedCod": { "type": "number" },
+        "deliveredAt": { "type": "string" },
+        "returnedAt": { "type": "string" },
+        "lastSyncedAt": { "type": "string" }
+      },
+      "required": ["packageId", "courierCompanyId", "trackingNumber", "courierStatus"]
+    },
+    "CourierManifest": {
+      "title": "Courier Manifest",
+      "description": "Handover batch manifest for external courier company",
+      "type": "object",
+      "properties": {
+        "courierCompanyId": { "type": "string" },
+        "manifestReference": { "type": "string" },
+        "dispatchDate": { "type": "string" },
+        "packageCount": { "type": "number" },
+        "expectedCod": { "type": "number" },
+        "preparedByUid": { "type": "string" },
+        "handedOverByUid": { "type": "string" },
+        "courierAcknowledgement": { "type": "string" },
+        "status": { "type": "string", "enum": ["draft", "dispatched", "acknowledged", "completed"] },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["courierCompanyId", "manifestReference", "packageCount", "status"]
+    },
+    "CourierRemittanceBatch": {
+      "title": "Courier Remittance Batch",
+      "description": "Courier 3PL financial settlement statement batch",
+      "type": "object",
+      "properties": {
+        "courierCompanyId": { "type": "string" },
+        "statementReference": { "type": "string" },
+        "statementDate": { "type": "string" },
+        "grossCod": { "type": "number" },
+        "deliveryCharges": { "type": "number" },
+        "returnCharges": { "type": "number" },
+        "otherDeductions": { "type": "number" },
+        "netExpectedRemittance": { "type": "number" },
+        "actualRemittedAmount": { "type": "number" },
+        "remittanceDate": { "type": "string" },
+        "bankReference": { "type": "string" },
+        "differenceAmount": { "type": "number" },
+        "status": { "type": "string", "enum": ["uploaded", "review", "matched", "discrepancy", "closed"] },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["courierCompanyId", "statementReference", "grossCod", "status"]
+    },
+    "CourierRemittanceLine": {
+      "title": "Courier Remittance Line",
+      "description": "Line item in courier remittance statement for a package",
+      "type": "object",
+      "properties": {
+        "batchId": { "type": "string" },
+        "packageId": { "type": "string" },
+        "trackingNumber": { "type": "string" },
+        "collectedCod": { "type": "number" },
+        "deliveryFee": { "type": "number" },
+        "netAmount": { "type": "number" },
+        "status": { "type": "string" }
+      },
+      "required": ["batchId", "packageId", "collectedCod"]
+    },
+    "CourierDeduction": {
+      "title": "Courier Deduction",
+      "description": "Fee or claim deduction applied by external courier",
+      "type": "object",
+      "properties": {
+        "batchId": { "type": "string" },
+        "packageId": { "type": "string" },
+        "deductionType": { "type": "string" },
+        "amount": { "type": "number" },
+        "courierExplanation": { "type": "string" },
+        "approvedByUid": { "type": "string" },
+        "supportingDocumentPath": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["deductionType", "amount", "courierExplanation"]
+    },
+    "CourierReturn": {
+      "title": "Courier Return",
+      "description": "Return package tracked through 3PL courier return pipeline",
+      "type": "object",
+      "properties": {
+        "packageId": { "type": "string" },
+        "courierCompanyId": { "type": "string" },
+        "trackingNumber": { "type": "string" },
+        "courierReturnStatus": { "type": "string", "enum": ["courier_returning", "courier_return_received", "inspected", "closed"] },
+        "receivedAt": { "type": "string" },
+        "receivedByUid": { "type": "string" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["packageId", "courierCompanyId", "courierReturnStatus"]
+    }
+  },
+  "firestore": {
+    "/financialAccounts/{id}": { "schema": { "$ref": "#/entities/FinancialAccount" }, "description": "Chart of accounts" },
+    "/financialTransactions/{id}": { "schema": { "$ref": "#/entities/FinancialTransaction" }, "description": "Financial transaction headers" },
+    "/financialPostings/{id}": { "schema": { "$ref": "#/entities/FinancialPosting" }, "description": "Double-entry posting lines" },
+    "/codCollections/{id}": { "schema": { "$ref": "#/entities/CODCollection" }, "description": "COD collection events" },
+    "/digitalPaymentVerifications/{id}": { "schema": { "$ref": "#/entities/DigitalPaymentVerification" }, "description": "Digital reference checks" },
+    "/riderSettlements/{id}": { "schema": { "$ref": "#/entities/RiderSettlement" }, "description": "Rider cash settlements" },
+    "/settlementLines/{id}": { "schema": { "$ref": "#/entities/SettlementLine" }, "description": "Rider settlement line items" },
+    "/bankDeposits/{id}": { "schema": { "$ref": "#/entities/BankDeposit" }, "description": "Bank cash deposits" },
+    "/bankDepositLines/{id}": { "schema": { "$ref": "#/entities/BankDepositLine" }, "description": "Bank deposit line items" },
+    "/financialAuditEvents/{id}": { "schema": { "$ref": "#/entities/FinancialAuditEvent" }, "description": "Financial audit logs" },
+    "/idempotencyKeys/{id}": { "schema": { "$ref": "#/entities/IdempotencyKey" }, "description": "Transaction deduplication keys" },
+    "/returns/{id}": { "schema": { "$ref": "#/entities/Return" }, "description": "Package return state records" },
+    "/returnCustodyEvents/{id}": { "schema": { "$ref": "#/entities/ReturnCustodyEvent" }, "description": "Return custody audit history" },
+    "/returnReceipts/{id}": { "schema": { "$ref": "#/entities/ReturnReceipt" }, "description": "Physical warehouse return receipts" },
+    "/reattemptRequests/{id}": { "schema": { "$ref": "#/entities/ReattemptRequest" }, "description": "Delivery reattempt approvals" },
+    "/customerServiceCases/{id}": { "schema": { "$ref": "#/entities/CustomerServiceCase" }, "description": "CS delivery exception cases" },
+    "/customerContactAttempts/{id}": { "schema": { "$ref": "#/entities/CustomerContactAttempt" }, "description": "Customer contact attempt history" },
+    "/exchanges/{id}": { "schema": { "$ref": "#/entities/Exchange" }, "description": "Product exchange mappings" },
+    "/exchangePackages/{id}": { "schema": { "$ref": "#/entities/ExchangePackage" }, "description": "Exchange package link items" },
+    "/courierShipments/{id}": { "schema": { "$ref": "#/entities/CourierShipment" }, "description": "3PL courier shipments" },
+    "/courierManifests/{id}": { "schema": { "$ref": "#/entities/CourierManifest" }, "description": "Courier manifest batches" },
+    "/courierRemittanceBatches/{id}": { "schema": { "$ref": "#/entities/CourierRemittanceBatch" }, "description": "3PL courier remittance statement batches" },
+    "/courierRemittanceLines/{id}": { "schema": { "$ref": "#/entities/CourierRemittanceLine" }, "description": "Package remittance statement lines" },
+    "/courierDeductions/{id}": { "schema": { "$ref": "#/entities/CourierDeduction" }, "description": "3PL courier fee and penalty deductions" },
+    "/courierReturns/{id}": { "schema": { "$ref": "#/entities/CourierReturn" }, "description": "3PL courier return tracking" }
+  }
+}
