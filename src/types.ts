@@ -456,14 +456,20 @@ export interface AnalyticsSummary {
 
 export interface Profile {
   id: string;
+  authUserId?: string;
   full_name?: string;
   fullName?: string;
   email?: string;
   phone?: string;
+  employeeCode?: string;
+  employee_code?: string;
   role: UserRole;
   active: boolean;
+  riderId?: string | null;
   created_at?: string;
   createdAt?: string;
+  updatedAt?: string;
+  lastLoginAt?: string;
   avatar?: string;
 }
 

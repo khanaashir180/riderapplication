@@ -2,7 +2,13 @@ const SHELL_CACHE = 'gomila-rider-shell-v1';
 const SHELL_ASSETS = ['/', '/manifest.webmanifest'];
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(SHELL_CACHE).then((cache) => cache.addAll(SHELL_ASSETS)));
+  event.waitUntil(
+    caches.open(SHELL_CACHE).then((cache) => {
+      return cache.addAll(SHELL_ASSETS).catch((err) => {
+        console.warn('SW cache addAll fallback:', err);
+      });
+    })
+  );
   self.skipWaiting();
 });
 
@@ -23,7 +29,17 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  if (url.pathname.startsWith('/api/') || url.pathname.includes('googleapis.com')) {
+  // Bypass API, dev modules, and external integrations
+  if (
+    url.pathname.startsWith('/api/') ||
+    url.pathname.startsWith('/@') ||
+    url.pathname.startsWith('/src/') ||
+    url.pathname.startsWith('/node_modules/') ||
+    url.pathname.includes('googleapis.com') ||
+    url.pathname.includes('firestore') ||
+    url.searchParams.has('t') ||
+    url.searchParams.has('v')
+  ) {
     return;
   }
 
@@ -42,8 +58,10 @@ self.addEventListener('fetch', (event) => {
           return response;
         }
         const cloned = response.clone();
-        caches.open(SHELL_CACHE).then((cache) => cache.put(request, cloned));
+        caches.open(SHELL_CACHE).then((cache) => cache.put(request, cloned)).catch(() => {});
         return response;
+      }).catch(() => {
+        return caches.match(request);
       });
     })
   );
